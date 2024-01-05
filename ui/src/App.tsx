@@ -23,6 +23,59 @@ function App() {
   const openConnect = () => setConnectOpen(true)
   const closeConnect = () => setConnectOpen(false)
 
+  type Safe = {
+    address: string,
+    peers: string[],
+    signers: string[],
+    delegates: string[],
+    txs: string[],
+    tx_sigs: string[],
+  };
+
+  const [safes, setSafes] = useState<Safe[]>([]);
+  const [newSafe, setNewSafe] = useState("");
+  const [newPeer, setNewPeer] = useState("");
+  const [newSigner, setNewSigner] = useState("");
+  const [newDelegate, setNewDelegate] = useState("");
+
+  const addSafe = async (safe) => {
+    let response = await fetch(`${BASE_URL}/safe`, {
+      method: "POST",
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ safe })
+    })
+    console.log("response!", response);
+    if (response.status == 200) {
+      setSafes(safes.concat({
+        address: safe,
+        peers: [],
+        signers: [],
+        delegates: [],
+        txs: [],
+        tx_sigs: [],
+      }))
+    }
+  }
+
+  const addPeer = async (safe, peer) => {
+    await fetch(`${BASE_URL}/safe/peer`, {
+      method: "POST",
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ peer, safe })
+    })
+  }
+
+  useEffect(() => { (async() => {
+      let response = await fetch(`${BASE_URL}/safes`, { method: "GET" });
+      let safes = []
+      let safes_response = await response.json()
+      for (let key in safes_response) 
+        safes.push({ address: key, ...safes_response[key] })
+
+      console.log("Safes", safes)
+      setSafes(safes)
+  })()}, []);
+
   useEffect(() => {
     // Get message history using http
 
@@ -55,6 +108,7 @@ function App() {
     }
   }, []);
 
+
   return (
     <div style={{ width: "100%" }}>
       <div style={{ position: "absolute", top: 4, left: 8 }}>
@@ -72,22 +126,30 @@ function App() {
       <ConnectWallet {...{connectOpen, closeConnect}} />
       <h2>Simple Safe app on Uqbar</h2>
       <div className="card">
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "row",
-            border: "1px solid gray",
-          }}
-        >
-          <div>
-            connected
-          </div>
-          <div
-            style={{ flex: 1, borderRight: "1px solid gray", padding: "1em" }}
-          >
+
+        <div style={{ display: "flex", flexDirection: "row", border: "1px solid gray", }} >
+          <input type="text" onInput={e=>setNewSafe(e.target.value)} value={newSafe} />
+          <button onClick={e=>addSafe(newSafe)}> Add safe </button>
+        </div>
+
+
+        <div style={{ display: "flex", flexDirection: "row", border: "1px solid gray", }} >
+          <div style={{ flex: 1, borderRight: "1px solid gray", padding: "1em" }} >
             <h3 style={{ marginTop: 0 }}>Safes</h3>
           </div>
+          { safes.map(safe => 
+              <div> 
+                { safe.address } 
+                <div style={{ display: "flex", flexDirection: "row", border: "1px solid gray", }} >
+                  <input type="text" onInput={e=>setNewPeer(e.target.value)} value={newPeer} />
+                  <button onClick={e=>addPeer(safe.address, newPeer )}>Add Peer</button>
+                </div>
+              </div>
+            ) 
+          } 
         </div>
+
+
       </div>
     </div>
   );
