@@ -1,296 +1,404 @@
-use std::collections::HashMap;
-
-use anyhow::{self};
-use serde::{Deserialize, Serialize};
-use uqbar_process_lib::{
-    await_message, get_payload,
-    http::{
-        bind_http_path, send_response, send_ws_push,
-        serve_ui, HttpServerRequest, IncomingHttpRequest, StatusCode, WsMessageType, bind_ws_path,
-    },
-    print_to_terminal, Address, Message, Payload, ProcessId, Request, Response,
+use alloy_rpc_types::Log;
+use alloy_sol_types::{sol, SolEvent};
+use anyhow::Result;
+use serde::{Deserialize, Serialize, };
+use std::collections::HashSet;
+use std::collections::hash_map::{ Entry, HashMap, };
+use std::str::FromStr;
+use uqbar_process_lib::{ 
+    await_message, call_init, get_payload, http, println, set_state,
+    Address, Message, NodeId, Payload, Request, 
 };
+use uqbar_process_lib::eth::{EthAddress, SubscribeLogsRequest};
 
 wit_bindgen::generate!({
-    path: "wit",
+    path: "../../../wit",
     world: "process",
     exports: {
         world: Component,
     },
 });
 
-#[derive(Debug, Serialize, Deserialize)]
-enum ChatRequest {
-    Send { target: String, message: String },
-    History,
+call_init!(init);
+
+sol! {
+    event ProxyCreation(address proxy, address singleton);
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-enum ChatResponse {
-    Ack,
-    History { messages: MessageArchive },
+enum IndexerActions {
+    EventSubscription(Log),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ChatMessage {
-    author: String,
-    content: String,
+#[derive(Clone, Serialize, Deserialize, Debug)]
+enum SafeActions {
+    AddSafe(AddSafe),
+    AddPeer(AddPeer)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct NewMessage {
-    chat: String,
-    author: String,
-    content: String,
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct AddPeer {
+    safe: EthAddress,
+    peer: NodeId,
 }
 
-type MessageArchive = HashMap<String, Vec<ChatMessage>>;
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct AddSafe {
+    safe: EthAddress,
+}
 
-fn handle_http_server_request(
-    our: &Address,
-    message_archive: &mut MessageArchive,
-    our_channel_id: &mut u32,
-    source: &Address,
-    ipc: &[u8],
-) -> anyhow::Result<()> {
-    let Ok(server_request) = serde_json::from_slice::<HttpServerRequest>(ipc) else {
-        // Fail silently if we can't parse the request
-        return Ok(());
+#[derive(Clone, Serialize, Deserialize)]
+struct SafeUser {
+    user: NodeId,
+    wallet: EthAddress,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SafeTx {
+    to: EthAddress,
+    value: u64,
+    data: Vec<u8>,
+    operation: u8,
+    safe_tx_gas: u64,
+    base_gas: u64,
+    gas_price: u64,
+    gas_token: Address,
+    refund_receiver: Address,
+    nonce: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct Safe {
+    peers: HashSet<NodeId>,
+    signers: Vec<SafeUser>,
+    delegates: Vec<SafeUser>,
+    txs: HashMap<u64, SafeTx>,
+    tx_sigs: HashMap<u64, Vec<u8>>,
+}
+
+fn print_type_of<T>(_: &T) {
+    println!("{}", std::any::type_name::<T>());
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct State {
+    ws_channel: u32,
+    safe_blocks: HashMap<EthAddress, u64>,
+    safes: HashMap<EthAddress, Safe>,
+}
+
+fn init (our: Address) {
+
+    let mut state = State {
+        ws_channel: 0,
+        safe_blocks: HashMap::new(),
+        safes: HashMap::new(),
     };
 
-    match server_request {
-        HttpServerRequest::WebSocketOpen { channel_id, .. } => {
-            // Set our channel_id to the newly opened channel
-            // Note: this code could be improved to support multiple channels
-            *our_channel_id = channel_id;
-        }
-        HttpServerRequest::WebSocketPush { .. } => {
-            let Some(payload) = get_payload() else {
-                return Ok(());
-            };
+    match main(our, state) {
+        Ok(_) => {}
+        Err(e) => println!("Error: {:?}", e)
+    }
+}
 
-            handle_chat_request(
-                our,
-                message_archive,
-                our_channel_id,
-                source,
-                &payload.bytes,
-                false,
-            )?;
-        }
-        HttpServerRequest::WebSocketClose(_channel_id) => {}
-        HttpServerRequest::Http(IncomingHttpRequest { method, .. }) => {
-            match method.as_str() {
-                // Get all messages
-                "GET" => {
-                    let mut headers = HashMap::new();
-                    headers.insert("Content-Type".to_string(), "application/json".to_string());
+fn main(our: Address, mut state: State) -> Result<()> {
 
-                    send_response(
-                        StatusCode::OK,
-                        Some(headers),
-                        serde_json::to_vec(&ChatResponse::History {
-                            messages: message_archive.clone(),
-                        })
-                        .unwrap(),
-                    )?;
-                }
-                // Send a message
-                "POST" => {
-                    let Some(payload) = get_payload() else {
-                        return Ok(());
-                    };
-                    handle_chat_request(
-                        our,
-                        message_archive,
-                        our_channel_id,
-                        source,
-                        &payload.bytes,
-                        true,
-                    )?;
+    SubscribeLogsRequest::new()
+        .address(EthAddress::from_str("0xc22834581ebc8527d974f8a1c97e1bea4ef910bc")?)
+        .from_block(2087031)
+        .events(vec!["ProxyCreation(address,address)"])
+        .send()?;
 
-                    // Send an http response via the http server
-                    send_response(StatusCode::CREATED, None, vec![])?;
-                }
-                _ => {
-                    // Method not allowed
-                    send_response(StatusCode::METHOD_NOT_ALLOWED, None, vec![])?;
-                }
+    http::bind_http_path("/", true, false).unwrap();
+    http::bind_http_path("/safe", true, false).unwrap();
+    http::bind_http_path("/safe/delegate", true, false).unwrap();
+    http::bind_http_path("/safe/peer", true, false).unwrap();
+    http::bind_http_path("/safe/send", true, false).unwrap();
+    http::bind_http_path("/safe/signer", true, false).unwrap();
+    http::bind_http_path("/safes", true, false).unwrap();
+    http::bind_ws_path("/", true, false).unwrap();
+
+    println!("Hello from Safe! {:?}", our);
+
+    loop {
+        match await_message() {
+            Err(e) => {
+                println!("Error: {:?}", e);
+                continue;
             }
+            Ok(msg) => match handle_request(&our, &msg, &mut state) {
+                Ok(()) => continue,
+                Err(e) => println!("Error: {:?}", e),
+            },
         }
-    };
+        let _ = set_state(&bincode::serialize(&state).unwrap());
+    }
+}
+
+fn handle_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+
+    if !msg.is_request() {
+        return Ok(());
+    }
+
+    if  msg.source().node != our.node {
+            handle_p2p_request(our, msg, state);
+    } else if
+        msg.source().node == our.node && 
+        msg.source().process == "terminal:terminal:uqbar" {
+            handle_terminal_request(msg);
+    } else if 
+        msg.source().node == our.node &&
+        msg.source().process == "http_server:sys:uqbar" {
+            handle_http_request(our, msg, state);
+    } else if
+        msg.source().node == our.node &&
+        msg.source().process == "eth:sys:uqbar" {
+            handle_eth_request(our, msg, state);
+    }
 
     Ok(())
+
 }
 
-fn handle_chat_request(
-    our: &Address,
-    message_archive: &mut MessageArchive,
-    channel_id: &mut u32,
-    source: &Address,
-    ipc: &[u8],
-    is_http: bool,
-) -> anyhow::Result<()> {
-    let Ok(chat_request) = serde_json::from_slice::<ChatRequest>(ipc) else {
-        // Fail silently if we can't parse the request
-        return Ok(());
-    };
+fn handle_eth_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
 
-    match chat_request {
-        ChatRequest::Send {
-            ref target,
-            ref message,
-        } => {
-            // counterparty will be the other node in the chat with us
-            let (counterparty, author) = if target == &our.node {
-                (&source.node, source.node.clone())
-            } else {
-                (target, our.node.clone())
-            };
-
-            // If the target is not us, send a request to the target
-
-            if target != &our.node {
-                print_to_terminal(0, &format!("new message from {}: {}", source.node, message));
-
-                match Request::new()
-                    .target(Address {
-                        node: target.clone(),
-                        process: ProcessId::from_str("safe:safe:template.uq")?,
-                    })
-                    .ipc(ipc)
-                    .send_and_await_response(5) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            print_to_terminal(0, format!("testing: send request error: {:?}", e,).as_str());
-                            return Ok(());
-                        }
-                    };
-            }
-
-            // Retreive the message archive for the counterparty, or create a new one if it doesn't exist
-            let messages = match message_archive.get_mut(counterparty) {
-                Some(messages) => messages,
-                None => {
-                    message_archive.insert(counterparty.clone(), Vec::new());
-                    message_archive.get_mut(counterparty).unwrap()
+    match serde_json::from_slice::<IndexerActions>(msg.ipc())? {
+        IndexerActions::EventSubscription(e) => {
+            match e.topics[0].clone() {
+                ProxyCreation::SIGNATURE_HASH => {
+                    let decoded = ProxyCreation::abi_decode_data(&e.data, false)?;
+                    let proxy = decoded.0.to_string();
+                    let block = e.block_number.expect("REASON").to::<u64>();
+                    state.safe_blocks.insert(EthAddress::from_str(&proxy)?, block);
                 }
-            };
-
-            let new_message = ChatMessage {
-                author: author.clone(),
-                content: message.clone(),
-            };
-
-            // If this is an HTTP request, handle the response in the calling function
-            if is_http {
-                // Add the new message to the archive
-                messages.push(new_message);
-                return Ok(());
+                _ => {}
             }
+        }
+        _ => {}
+    }
 
-            // If this is not an HTTP request, send a response to the other node
-            Response::new()
-                .ipc(serde_json::to_vec(&ChatResponse::Ack).unwrap())
-                .send()
-                .unwrap();
+    Ok(())
 
-            // Add the new message to the archive
-            messages.push(new_message);
+}
 
-            // Generate a Payload for the new message
-            let payload = Payload {
-                mime: Some("application/json".to_string()),
-                bytes: serde_json::json!({
-                    "NewMessage": NewMessage {
-                        chat: counterparty.clone(),
-                        author,
-                        content: message.clone(),
-                    }
+fn handle_p2p_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+
+    println!("handling p2p request");
+
+    match serde_json::from_slice::<SafeActions>(msg.ipc())? {
+        SafeActions::AddSafe(AddSafe{ safe }) => {
+            println!("add safe: {:?}", safe);
+
+            let safe = state.safes.entry(safe).or_insert(Safe::default());
+            safe.peers.insert(msg.source().node.clone());
+
+            Request::new()
+                .target((&our.node, "http_server", "sys", "uqbar"))
+                .ipc(serde_json::to_vec(
+                    &http::HttpServerRequest::WebSocketPush {
+                        channel_id: state.ws_channel,
+                        message_type: http::WsMessageType::Binary,
+                    },
+                )?)
+                .payload(Payload {
+                    mime: Some("application/json".to_string()),
+                    bytes: serde_json::json!({"safe": safe}).to_string().into_bytes()
                 })
-                .to_string()
-                .as_bytes()
-                .to_vec(),
-            };
-
-            // Send a WebSocket message to the http server in order to update the UI
-            send_ws_push(
-                our.node.clone(),
-                channel_id.clone(),
-                WsMessageType::Text,
-                payload,
-            )?;
+                .send()?;
         }
-        ChatRequest::History => {
-            // If this is an HTTP request, send a response to the http server
-
-            Response::new()
-                .ipc(
-                    serde_json::to_vec(&ChatResponse::History {
-                        messages: message_archive.clone(),
-                    })
-                    .unwrap(),
-                )
-                .send()
-                .unwrap();
-        }
-    };
-
-    Ok(())
-}
-
-fn handle_message(
-    our: &Address,
-    message_archive: &mut MessageArchive,
-    channel_id: &mut u32,
-) -> anyhow::Result<()> {
-    let message = await_message().unwrap();
-
-    match message {
-        Message::Response { .. } => {
-            print_to_terminal(0, &format!("safe: got response - {:?}", message));
-            return Ok(());
-        }
-        Message::Request {
-            ref source,
-            ref ipc,
-            ..
-        } => {
-            // Requests that come from other nodes running this app
-            handle_chat_request(our, message_archive, channel_id, source, &ipc, false)?;
-            // Requests that come from our http server
-            handle_http_server_request(our, message_archive, channel_id, source, ipc)?;
+        SafeActions::AddPeer(AddPeer{ safe, peer }) => {
+            println!("add peer: {:?} {:?}", safe, peer);
         }
     }
 
     Ok(())
 }
 
-struct Component;
-impl Guest for Component {
-    fn init(our: String) {
-        print_to_terminal(0, "safe: begin");
+fn handle_terminal_request(msg: &Message) -> anyhow::Result<()> {
+    println!("terminal message: {:?}", msg);
+    Ok(())
+}
 
-        let our = Address::from_str(&our).unwrap();
-        let mut message_archive: MessageArchive = HashMap::new();
-        let mut channel_id = 0;
-
-        // Bind UI files to routes; index.html is bound to "/"
-        serve_ui(&our, "ui").unwrap();
-
-        // Bind HTTP path /messages
-        bind_http_path("/messages", true, false).unwrap();
-
-        // Bind WebSocket path
-        bind_ws_path("/", true, false).unwrap();
-
-        loop {
-            match handle_message(&our, &mut message_archive, &mut channel_id) {
-                Ok(()) => {}
+fn handle_http_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+    match serde_json::from_slice::<http::HttpServerRequest>(msg.ipc())? {
+        http::HttpServerRequest::Http(ref incoming) => {
+            match handle_http_methods(our, state, incoming) {
+                Ok(()) => Ok(()),
                 Err(e) => {
-                    print_to_terminal(0, format!("safe: error: {:?}", e).as_str());
+                    http::send_response(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        None,
+                        "Service Unavailable".to_string().as_bytes().to_vec(),
+                    )
+                }
+            }
+        }
+        http::HttpServerRequest::WebSocketOpen { path, channel_id } => {
+            state.ws_channel = channel_id;
+            Ok(())
+        }
+        http::HttpServerRequest::WebSocketClose (channel_id) => {
+            Ok(())
+        }
+        http::HttpServerRequest::WebSocketPush { .. } => {
+            Ok(())
+        }
+        _ => {
+            Ok(())
+        }
+    }
+
+}
+
+fn handle_http_methods(
+    our: &Address, 
+    state: &mut State, 
+    http_request: &http::IncomingHttpRequest,
+) -> anyhow::Result<()> {
+
+    if let Ok(path) = http_request.path() {
+        println!("http path: {:?}, method: {:?}", path, http_request.method);
+        match &path[..] {
+            "" => handle_http_slash(our, state, http_request),
+            "safe" => handle_http_safe(our, state, http_request),
+            "safes" => handle_http_safes(our, state, http_request),
+            "safe/delegate" => handle_http_safe_delegate(our, state, http_request),
+            "safe/peer" => handle_http_safe_peer(our, state, http_request),
+            "safe/send" => handle_http_safe_send(our, state, http_request),
+            "safe/signer" => handle_http_safe_signer(our, state, http_request),
+            &_ => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![])
+        }
+    } else {
+        Ok(())
+    }
+
+}
+
+fn handle_http_slash(
+    our: &Address,
+    state: &mut State,
+    http_request: &http::IncomingHttpRequest,
+) -> anyhow::Result<()> {
+
+    match http_request.method.as_str() {
+        // on GET: give the frontend all of our active games
+        "GET" => {
+            println!("GET!");
+            http::send_response(http::StatusCode::OK, None, vec![]);
+            Ok(())
+        }
+        "POST" => {
+            println!("POST!");
+            Ok(())
+        }
+        "PUT" => {
+            println!("PUT!");
+            Ok(())
+        }
+        "DELETE" => {
+            println!("DELETE!");
+            Ok(())
+        }
+        _ => {
+            http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+            Ok(())
+        }
+    }
+
+}
+
+fn handle_http_safe(
+    our: &Address, 
+    state: &mut State, 
+    http_request: &http::IncomingHttpRequest
+) -> anyhow::Result<()> { 
+    match http_request.method.as_str() {
+        // on GET: give the frontend all of our active games
+        "GET" => {
+            println!("GET!");
+            http::send_response(http::StatusCode::OK, None, vec![]);
+            Ok(())
+        }
+        "POST" => {
+            let Some(payload) = get_payload() else {
+                return http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+            };
+
+            let AddSafe{ safe } = serde_json::from_slice::<AddSafe>(&payload.bytes)?;
+
+            match state.safes.entry(safe) {
+                Entry::Vacant(v) => {
+                    v.insert(Safe::default());
+                    http::send_response(http::StatusCode::OK, None, vec![]);
+                }
+                Entry::Occupied(_) => {
+                    http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+                }
+            }
+
+            Ok(())
+        }
+        "PUT" => {
+            println!("PUT!");
+            Ok(())
+        }
+        "DELETE" => {
+            println!("DELETE!");
+            Ok(())
+        }
+        _ => {
+            http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+            Ok(())
+        }
+    }
+
+}
+
+fn handle_http_safes(
+    our: &Address, 
+    state: &mut State, 
+    http_request: &http::IncomingHttpRequest
+) -> anyhow::Result<()> { 
+    match http_request.method.as_str() {
+        "GET" => http::send_response(http::StatusCode::OK, None, serde_json::to_vec(&state.safes)?),
+        _ => http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![])
+    }
+}
+
+fn handle_http_safe_peer(
+    our: &Address, 
+    state: &mut State, 
+    http_request: &http::IncomingHttpRequest
+) -> anyhow::Result<()> { 
+    println!("safe peer {}", http_request.method.as_str());
+    match http_request.method.as_str() {
+        "POST" => {
+            let payload = get_payload().unwrap();
+
+            let AddPeer{ peer, safe } = serde_json::from_slice::<AddPeer>(&payload.bytes)?;
+
+            match state.safes.entry(safe) {
+                Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
+                Entry::Occupied(mut o) => {
+                    let saved_safe = o.get_mut();
+                    saved_safe.peers.insert(peer.clone());
+                    Request::new()
+                        .target(Address{node:peer, process:our.process.clone()})
+                        .ipc(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{safe:safe}))?)
+                        .send()?;
+                    http::send_response(http::StatusCode::OK, None, vec![])
                 }
             };
         }
+        _ => {
+            http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+        }
     }
+    Ok(()) 
 }
+
+fn handle_http_safe_delegate(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
+fn handle_http_safe_send(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
+fn handle_http_safe_signer(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
+

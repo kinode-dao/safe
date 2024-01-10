@@ -4,10 +4,12 @@
         "process_wasm_path": "/safe.wasm",
         "on_exit": "Restart",
         "request_networking": true,
-        "request_messaging": [
-            "net:sys:uqbar"
+        "request_capabilities": [
+		"eth:sys:nectar",
+		"http_server:sys:nectar",
+		"net:sys:nectar"
         ],
-        "grant_messaging": [],
+        "grant_capabilities": [],
         "public": true
     }
 ]
