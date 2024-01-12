@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::{ Entry, HashMap, };
 use std::str::FromStr;
 use nectar_process_lib::{ 
-    await_message, get_blob, http, println, set_state,
+    await_message, get_blob, get_state, http, println, set_state,
     Address, Message, NodeId, LazyLoadBlob, Request, 
 };
 use nectar_process_lib::eth::{EthAddress, SubscribeLogsRequest};
@@ -74,10 +74,6 @@ struct Safe {
     tx_sigs: HashMap<u64, Vec<u8>>,
 }
 
-fn print_type_of<T>(_: &T) {
-    println!("{}", std::any::type_name::<T>());
-}
-
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct State {
     ws_channel: u32,
@@ -91,16 +87,23 @@ impl Guest for Component {
 
         let our = Address::from_str(&our).unwrap();
 
-        let state = State {
-            ws_channel: 0,
-            safe_blocks: HashMap::new(),
-            safes: HashMap::new(),
+        let state = match get_state() {
+            Some(state) => {
+                println!("...");
+                bincode::deserialize::<State>(&state).unwrap()
+            },
+            None => State {
+                ws_channel: 0,
+                safe_blocks: HashMap::new(),
+                safes: HashMap::new(),
+            }
         };
 
         match main(our, state) {
             Ok(_) => {}
             Err(e) => println!("Error: {:?}", e)
-        }
+        };
+
     }
 }
 
@@ -130,11 +133,13 @@ fn main(our: Address, mut state: State) -> Result<()> {
                 continue;
             }
             Ok(msg) => match handle_request(&our, &msg, &mut state) {
-                Ok(()) => continue,
+                Ok(()) => { 
+                    let _ = set_state(&bincode::serialize(&state).unwrap());
+                    continue;
+                }
                 Err(e) => println!("Error: {:?}", e),
             },
         }
-        let _ = set_state(&bincode::serialize(&state).unwrap());
     }
 }
 
