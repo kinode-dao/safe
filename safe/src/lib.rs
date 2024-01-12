@@ -5,21 +5,19 @@ use serde::{Deserialize, Serialize, };
 use std::collections::HashSet;
 use std::collections::hash_map::{ Entry, HashMap, };
 use std::str::FromStr;
-use uqbar_process_lib::{ 
-    await_message, call_init, get_payload, http, println, set_state,
-    Address, Message, NodeId, Payload, Request, 
+use nectar_process_lib::{ 
+    await_message, get_blob, http, println, set_state,
+    Address, Message, NodeId, LazyLoadBlob, Request, 
 };
-use uqbar_process_lib::eth::{EthAddress, SubscribeLogsRequest};
+use nectar_process_lib::eth::{EthAddress, SubscribeLogsRequest};
 
 wit_bindgen::generate!({
-    path: "../../../wit",
+    path: "wit",
     world: "process",
     exports: {
         world: Component,
     },
 });
-
-call_init!(init);
 
 sol! {
     event ProxyCreation(address proxy, address singleton);
@@ -87,17 +85,22 @@ struct State {
     safes: HashMap<EthAddress, Safe>,
 }
 
-fn init (our: Address) {
+struct Component;
+impl Guest for Component {
+    fn init (our: String) {
 
-    let mut state = State {
-        ws_channel: 0,
-        safe_blocks: HashMap::new(),
-        safes: HashMap::new(),
-    };
+        let our = Address::from_str(&our).unwrap();
 
-    match main(our, state) {
-        Ok(_) => {}
-        Err(e) => println!("Error: {:?}", e)
+        let state = State {
+            ws_channel: 0,
+            safe_blocks: HashMap::new(),
+            safes: HashMap::new(),
+        };
+
+        match main(our, state) {
+            Ok(_) => {}
+            Err(e) => println!("Error: {:?}", e)
+        }
     }
 }
 
@@ -142,19 +145,19 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Re
     }
 
     if  msg.source().node != our.node {
-            handle_p2p_request(our, msg, state);
+            let _ = handle_p2p_request(our, msg, state);
     } else if
         msg.source().node == our.node && 
         msg.source().process == "terminal:terminal:uqbar" {
-            handle_terminal_request(msg);
+            let _ = handle_terminal_request(msg);
     } else if 
         msg.source().node == our.node &&
         msg.source().process == "http_server:sys:uqbar" {
-            handle_http_request(our, msg, state);
+            let _ = handle_http_request(our, msg, state);
     } else if
         msg.source().node == our.node &&
         msg.source().process == "eth:sys:uqbar" {
-            handle_eth_request(our, msg, state);
+            let _ = handle_eth_request(our, msg, state);
     }
 
     Ok(())
@@ -163,7 +166,7 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Re
 
 fn handle_eth_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
 
-    match serde_json::from_slice::<IndexerActions>(msg.ipc())? {
+    match serde_json::from_slice::<IndexerActions>(msg.body())? {
         IndexerActions::EventSubscription(e) => {
             match e.topics[0].clone() {
                 ProxyCreation::SIGNATURE_HASH => {
@@ -186,7 +189,7 @@ fn handle_p2p_request(our: &Address, msg: &Message, state: &mut State) -> anyhow
 
     println!("handling p2p request");
 
-    match serde_json::from_slice::<SafeActions>(msg.ipc())? {
+    match serde_json::from_slice::<SafeActions>(msg.body())? {
         SafeActions::AddSafe(AddSafe{ safe }) => {
             println!("add safe: {:?}", safe);
 
@@ -195,13 +198,13 @@ fn handle_p2p_request(our: &Address, msg: &Message, state: &mut State) -> anyhow
 
             Request::new()
                 .target((&our.node, "http_server", "sys", "uqbar"))
-                .ipc(serde_json::to_vec(
+                .body(serde_json::to_vec(
                     &http::HttpServerRequest::WebSocketPush {
                         channel_id: state.ws_channel,
                         message_type: http::WsMessageType::Binary,
                     },
                 )?)
-                .payload(Payload {
+                .blob(LazyLoadBlob {
                     mime: Some("application/json".to_string()),
                     bytes: serde_json::json!({"safe": safe}).to_string().into_bytes()
                 })
@@ -221,11 +224,11 @@ fn handle_terminal_request(msg: &Message) -> anyhow::Result<()> {
 }
 
 fn handle_http_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
-    match serde_json::from_slice::<http::HttpServerRequest>(msg.ipc())? {
+    match serde_json::from_slice::<http::HttpServerRequest>(msg.body())? {
         http::HttpServerRequest::Http(ref incoming) => {
             match handle_http_methods(our, state, incoming) {
                 Ok(()) => Ok(()),
-                Err(e) => {
+                Err(_) => {
                     http::send_response(
                         http::StatusCode::SERVICE_UNAVAILABLE,
                         None,
@@ -285,7 +288,7 @@ fn handle_http_slash(
         // on GET: give the frontend all of our active games
         "GET" => {
             println!("GET!");
-            http::send_response(http::StatusCode::OK, None, vec![]);
+            let _ = http::send_response(http::StatusCode::OK, None, vec![]);
             Ok(())
         }
         "POST" => {
@@ -301,7 +304,7 @@ fn handle_http_slash(
             Ok(())
         }
         _ => {
-            http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
             Ok(())
         }
     }
@@ -317,23 +320,23 @@ fn handle_http_safe(
         // on GET: give the frontend all of our active games
         "GET" => {
             println!("GET!");
-            http::send_response(http::StatusCode::OK, None, vec![]);
+            let _ = http::send_response(http::StatusCode::OK, None, vec![]);
             Ok(())
         }
         "POST" => {
-            let Some(payload) = get_payload() else {
+            let Some(blob) = get_blob() else {
                 return http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
             };
 
-            let AddSafe{ safe } = serde_json::from_slice::<AddSafe>(&payload.bytes)?;
+            let AddSafe{ safe } = serde_json::from_slice::<AddSafe>(&blob.bytes)?;
 
             match state.safes.entry(safe) {
                 Entry::Vacant(v) => {
                     v.insert(Safe::default());
-                    http::send_response(http::StatusCode::OK, None, vec![]);
+                    let _ = http::send_response(http::StatusCode::OK, None, vec![]);
                 }
                 Entry::Occupied(_) => {
-                    http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+                    let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
                 }
             }
 
@@ -348,7 +351,7 @@ fn handle_http_safe(
             Ok(())
         }
         _ => {
-            http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
             Ok(())
         }
     }
@@ -374,25 +377,25 @@ fn handle_http_safe_peer(
     println!("safe peer {}", http_request.method.as_str());
     match http_request.method.as_str() {
         "POST" => {
-            let payload = get_payload().unwrap();
+            let blob = get_blob().unwrap();
 
-            let AddPeer{ peer, safe } = serde_json::from_slice::<AddPeer>(&payload.bytes)?;
+            let AddPeer{ peer, safe } = serde_json::from_slice::<AddPeer>(&blob.bytes)?;
 
-            match state.safes.entry(safe) {
+            let _ = match state.safes.entry(safe) {
                 Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
                 Entry::Occupied(mut o) => {
                     let saved_safe = o.get_mut();
                     saved_safe.peers.insert(peer.clone());
                     Request::new()
                         .target(Address{node:peer, process:our.process.clone()})
-                        .ipc(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{safe:safe}))?)
+                        .body(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{safe:safe}))?)
                         .send()?;
                     http::send_response(http::StatusCode::OK, None, vec![])
                 }
             };
         }
         _ => {
-            http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
         }
     }
     Ok(()) 
