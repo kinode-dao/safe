@@ -42,16 +42,16 @@ struct AddPeer {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct AddSafe {
-    safe: EthAddress,
+    safe: Safe,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct SafeUser {
     user: NodeId,
     wallet: EthAddress,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct SafeTx {
     to: EthAddress,
     value: u64,
@@ -65,13 +65,14 @@ struct SafeTx {
     nonce: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 struct Safe {
-    peers: HashSet<NodeId>,
-    signers: Vec<SafeUser>,
-    delegates: Vec<SafeUser>,
-    txs: HashMap<u64, SafeTx>,
-    tx_sigs: HashMap<u64, Vec<u8>>,
+    address: EthAddress,
+    delegates: Option<Vec<SafeUser>>,
+    peers: Option<HashSet<NodeId>>,
+    signers: Option<Vec<SafeUser>>,
+    txs: Option<HashMap<u64, SafeTx>>,
+    tx_sigs: Option<HashMap<u64, Vec<u8>>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -200,22 +201,30 @@ fn handle_p2p_request(our: &Address, msg: &Message, state: &mut State) -> anyhow
         SafeActions::AddSafe(AddSafe{ safe }) => {
             println!("add safe: {:?}", safe);
 
-            let safe = state.safes.entry(safe).or_insert(Safe::default());
-            safe.peers.insert(msg.source().node.clone());
+            match state.safes.entry(safe.address) {
+                Entry::Vacant(entry) => {
 
-            Request::new()
-                .target((&our.node, "http_server", "sys", "nectar"))
-                .body(serde_json::to_vec(
-                    &http::HttpServerRequest::WebSocketPush {
-                        channel_id: state.ws_channel,
-                        message_type: http::WsMessageType::Binary,
-                    },
-                )?)
-                .blob(LazyLoadBlob {
-                    mime: Some("application/json".to_string()),
-                    bytes: serde_json::json!({"safe": safe}).to_string().into_bytes()
-                })
-                .send()?;
+                    entry.insert(safe.clone());
+
+                    Request::new()
+                        .target((&our.node, "http_server", "sys", "nectar"))
+                        .body(serde_json::to_vec(
+                            &http::HttpServerRequest::WebSocketPush {
+                                channel_id: state.ws_channel,
+                                message_type: http::WsMessageType::Binary,
+                            },
+                        )?)
+                        .blob(LazyLoadBlob {
+                            mime: Some("application/json".to_string()),
+                            bytes: serde_json::json!({"safe": safe}).to_string().into_bytes()
+                        })
+                        .send()?;
+                }
+                Entry::Occupied(entry) => {
+
+                }
+            }
+
         }
         SafeActions::AddPeer(AddPeer{ safe, peer }) => {
             println!("add peer: {:?} {:?}", safe, peer);
@@ -330,7 +339,6 @@ fn handle_http_safe(
     println!("handling http_safe");
 
     match http_request.method.as_str() {
-        // on GET: give the frontend all of our active games
         "GET" => {
             println!("GET!");
             let _ = http::send_response(http::StatusCode::OK, None, vec![]);
@@ -341,11 +349,17 @@ fn handle_http_safe(
                 return http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
             };
 
-            let AddSafe{ safe } = serde_json::from_slice::<AddSafe>(&blob.bytes)?;
+            // let AddSafe { safe } = serde_json::from_slice::<AddSafe>(&blob.bytes)?;
+            let AddSafe { safe } = serde_json::from_slice::<AddSafe>(&blob.bytes).unwrap_or_else(|err| {
+                println!("Error while parsing JSON: {:?}", err);
+                std::process::exit(1);
+            });
 
-            match state.safes.entry(safe) {
+            println!("Add Safe: {:?}", safe);
+
+            match state.safes.entry(safe.address) {
                 Entry::Vacant(v) => {
-                    v.insert(Safe::default());
+                    v.insert(safe);
                     let _ = http::send_response(http::StatusCode::OK, None, vec![]);
                 }
                 Entry::Occupied(_) => {
@@ -400,13 +414,17 @@ fn handle_http_safe_peer(
             let _ = match state.safes.entry(safe) {
                 Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
                 Entry::Occupied(mut o) => {
+
                     let saved_safe = o.get_mut();
-                    saved_safe.peers.insert(peer.clone());
+                    saved_safe.peers.get_or_insert(HashSet::new()).insert(peer.clone());
+
                     Request::new()
                         .target(Address{node:peer, process:our.process.clone()})
-                        .body(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{safe:safe}))?)
+                        .body(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{ safe: saved_safe.clone() }))?)
                         .send()?;
+
                     http::send_response(http::StatusCode::OK, None, vec![])
+
                 }
             };
         }
