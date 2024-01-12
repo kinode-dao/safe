@@ -128,7 +128,7 @@ function App() {
       <div className="card">
 
         <div style={{ display: "flex", flexDirection: "row", border: "1px solid gray", }} >
-          <input type="text" onInput={e=>setNewSafe(e.target.value)} value={newSafe} />
+          <input type="text" onInput={e=>setNewSafe((e.target as HTMLInputElement).value)} value={newSafe} />
           <button onClick={e=>addSafe(newSafe)}> Add safe </button>
         </div>
 
@@ -141,7 +141,7 @@ function App() {
               <div> 
                 { safe.address } 
                 <div style={{ display: "flex", flexDirection: "row", border: "1px solid gray", }} >
-                  <input type="text" onInput={e=>setNewPeer(e.target.value)} value={newPeer} />
+                  <input type="text" onInput={e=>setNewPeer((e.target as HTMLInputElement).value)} value={newPeer} />
                   <button onClick={e=>addPeer(safe.address, newPeer )}>Add Peer</button>
                 </div>
               </div>
