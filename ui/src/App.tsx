@@ -41,14 +41,12 @@ const WEBSOCKET_URL = import.meta.env.DEV
   
     const addSafe = async (safe) => {
   
-      console.log("add safe", safe, `${BASE_URL}/safe`)
-  
       let response = await fetch(`${BASE_URL}/safe`, {
         method: "POST",
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ safe })
+        body: JSON.stringify({ safe: { address: safe }})
       })
-      console.log("response!", response);
+
       if (response.status == 200) {
         setSafes(safes.concat({
           address: safe,
@@ -73,6 +71,7 @@ const WEBSOCKET_URL = import.meta.env.DEV
         let response = await fetch(`${BASE_URL}/safes`, { method: "GET" });
         let safes = []
         let safes_response = await response.json()
+        console.log("safe responses", safes_response)
         for (let key in safes_response) 
           safes.push({ address: key, ...safes_response[key] })
   
@@ -91,15 +90,32 @@ const WEBSOCKET_URL = import.meta.env.DEV
             console.log("Connected to uqbar node");
             // api.send({ data: "Hello World" });
           },
-          onMessage: (json, _api) => {
-            console.log('WEBSOCKET MESSAGE', json)
-            try {
-              const data = JSON.parse(json);
-              console.log("WebSocket received message", data);
-              const [messageType] = Object.keys(data);
-              if (!messageType) return;
-            } catch (error) {
-              console.error("Error parsing WebSocket message", error);
+          onMessage: (json: string | Blob) => {
+            if (typeof json === 'string') {
+            } else {
+              const reader = new FileReader();
+    
+              reader.onload = function(event) {
+                if (typeof event?.target?.result === 'string') {
+                  try {
+                    const { safe } = JSON.parse(event.target.result);
+
+                    if (safes.find(s => s.address == safe.address)) {
+                      console.log("Safe already exists", safe.address)
+                      return
+                    } 
+
+                    console.log("adding", safe);
+
+                    setSafes(prevSafes => prevSafes.concat(safe))
+    
+                  } catch (error) {
+                    console.error("Error parsing WebSocket message", error);
+                  }
+                }
+              };
+    
+              reader.readAsText(json);
             }
           },
         });
@@ -109,7 +125,8 @@ const WEBSOCKET_URL = import.meta.env.DEV
         setNodeConnected(false);
       }
     }, []);
-  
+
+    console.log("rendering", safes);
   
     return (
       <div style={{ width: "100%" }}>

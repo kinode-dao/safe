@@ -18,10 +18,6 @@ const BASE_URL = `/${manifest[0].process_name}:${metadata.package}:${metadata.pu
 // This is the proxy URL, it must match the node you are developing against
 const PROXY_URL = (process.env.VITE_NODE_URL || 'http://127.0.0.1:8080').replace('localhost', '127.0.0.1');
 
-console.log("PROXY_URL", PROXY_URL);
-
-console.log('process.env.VITE_NODE_URL', process.env.VITE_NODE_URL, PROXY_URL);
-
 export default defineConfig({
   plugins: [react()],
   base: BASE_URL,
