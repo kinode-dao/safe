@@ -5,9 +5,9 @@
         "on_exit": "Restart",
         "request_networking": true,
         "request_capabilities": [
-		"eth:sys:nectar",
-		"http_server:sys:nectar",
-		"net:sys:nectar"
+            "eth:sys:nectar",
+            "http_server:sys:nectar",
+            "net:sys:nectar"
         ],
         "grant_capabilities": [],
         "public": true

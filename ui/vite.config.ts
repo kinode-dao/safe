@@ -2,7 +2,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 /*
-If you are developing a UI outside of an Uqbar project,
+If you are developing a UI outside of a Nectar project,
 comment out the following 2 lines:
 */
 import manifest from '../pkg/manifest.json'
@@ -17,6 +17,8 @@ const BASE_URL = `/${manifest[0].process_name}:${metadata.package}:${metadata.pu
 
 // This is the proxy URL, it must match the node you are developing against
 const PROXY_URL = (process.env.VITE_NODE_URL || 'http://127.0.0.1:8080').replace('localhost', '127.0.0.1');
+
+console.log("PROXY_URL", PROXY_URL);
 
 console.log('process.env.VITE_NODE_URL', process.env.VITE_NODE_URL, PROXY_URL);
 

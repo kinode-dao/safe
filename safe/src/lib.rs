@@ -148,15 +148,17 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Re
             let _ = handle_p2p_request(our, msg, state);
     } else if
         msg.source().node == our.node && 
-        msg.source().process == "terminal:terminal:uqbar" {
+        msg.source().process == "terminal:terminal:nectar" {
             let _ = handle_terminal_request(msg);
     } else if 
         msg.source().node == our.node &&
-        msg.source().process == "http_server:sys:uqbar" {
+        msg.source().process == "http_server:sys:nectar" {
+
+            println!("1");
             let _ = handle_http_request(our, msg, state);
     } else if
         msg.source().node == our.node &&
-        msg.source().process == "eth:sys:uqbar" {
+        msg.source().process == "eth:sys:nectar" {
             let _ = handle_eth_request(our, msg, state);
     }
 
@@ -197,7 +199,7 @@ fn handle_p2p_request(our: &Address, msg: &Message, state: &mut State) -> anyhow
             safe.peers.insert(msg.source().node.clone());
 
             Request::new()
-                .target((&our.node, "http_server", "sys", "uqbar"))
+                .target((&our.node, "http_server", "sys", "nectar"))
                 .body(serde_json::to_vec(
                     &http::HttpServerRequest::WebSocketPush {
                         channel_id: state.ws_channel,
@@ -224,6 +226,9 @@ fn handle_terminal_request(msg: &Message) -> anyhow::Result<()> {
 }
 
 fn handle_http_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+
+    println!("handling http request");
+
     match serde_json::from_slice::<http::HttpServerRequest>(msg.body())? {
         http::HttpServerRequest::Http(ref incoming) => {
             match handle_http_methods(our, state, incoming) {
@@ -316,6 +321,9 @@ fn handle_http_safe(
     state: &mut State, 
     http_request: &http::IncomingHttpRequest
 ) -> anyhow::Result<()> { 
+
+    println!("handling http_safe");
+
     match http_request.method.as_str() {
         // on GET: give the frontend all of our active games
         "GET" => {
@@ -363,6 +371,9 @@ fn handle_http_safes(
     state: &mut State, 
     http_request: &http::IncomingHttpRequest
 ) -> anyhow::Result<()> { 
+
+    println!("handling http_safes");
+
     match http_request.method.as_str() {
         "GET" => http::send_response(http::StatusCode::OK, None, serde_json::to_vec(&state.safes)?),
         _ => http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![])
