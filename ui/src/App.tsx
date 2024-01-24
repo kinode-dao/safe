@@ -91,6 +91,9 @@ const WEBSOCKET_URL = import.meta.env.DEV
             // api.send({ data: "Hello World" });
           },
           onMessage: (json: string | Blob) => {
+
+            console.log("json", json);
+
             if (typeof json === 'string') {
             } else {
               const reader = new FileReader();
@@ -98,6 +101,7 @@ const WEBSOCKET_URL = import.meta.env.DEV
               reader.onload = function(event) {
                 if (typeof event?.target?.result === 'string') {
                   try {
+                    console.log("parsing", event.target.result);
                     const { safe } = JSON.parse(event.target.result);
 
                     if (safes.find(s => s.address == safe.address)) {
@@ -125,8 +129,6 @@ const WEBSOCKET_URL = import.meta.env.DEV
         setNodeConnected(false);
       }
     }, []);
-
-    console.log("rendering", safes);
   
     return (
       <div style={{ width: "100%" }}>
