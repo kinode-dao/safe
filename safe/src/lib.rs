@@ -166,7 +166,21 @@ fn handle_response(our: &Address, msg: &Message, state: &mut State) -> anyhow::R
 
 fn handle_request(our: &Address, msg: &Message, state: &mut State, provider: &mut Provider) -> anyhow::Result<()> {
 
+    println!("handling request {:?}", msg);
+
     match serde_json::from_slice::<EthProviderRequests>(msg.body())? {
+        EthProviderRequests::RpcResponse(rpc_response) => {
+            println!("response.... {:?}", rpc_response);
+
+            let closure_id = msg.metadata().unwrap().parse::<u64>().unwrap();
+
+            provider.receive(closure_id, rpc_response.result.as_bytes().to_vec());
+
+        }
+        EthProviderRequests::RpcRequest(rpc_request) => {
+            println!("request.... {:?}", rpc_request);
+
+        }
         EthProviderRequests::Test => {
             println!("test");
 
