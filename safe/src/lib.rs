@@ -10,8 +10,16 @@ use kinode_process_lib::{
 };
 use kinode_process_lib::eth_alloy::{
     Address as AlloyAddress,
-    AlloySubscribeLogsRequest
+    AlloyLog,
+    AlloySubscribeLogsRequest,
+    EthProviderRequests,
+    Provider,
+    ProviderMethod,
+    ValueOrArray,
 };
+use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::borrow::BorrowMut;
 
 wit_bindgen::generate!({
     path: "wit",
@@ -72,7 +80,6 @@ struct Safe {
     tx_sigs: Option<HashMap<u64, Vec<u8>>>,
 }
 
-
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct State {
     ws_channel: u32,
@@ -84,15 +91,10 @@ struct Component;
 impl Guest for Component {
     fn init (our: String) {
 
-        println!("OUR!!!!!!!!!!!!! {:?}", our);
-
         let our = Address::from_str(&our).unwrap();
 
         let state = match get_state() {
-            Some(state) => {
-                println!("...");
-                bincode::deserialize::<State>(&state).unwrap()
-            },
+            Some(state) => bincode::deserialize::<State>(&state).unwrap(),
             None => State {
                 ws_channel: 0,
                 safe_blocks: HashMap::new(),
@@ -110,11 +112,20 @@ impl Guest for Component {
 
 fn main(our: Address, mut state: State) -> Result<()> {
 
-    AlloySubscribeLogsRequest::new()
+    let mut provider = Provider { closures: HashMap::new(), count: 0 };
+
+    let safe_creation_subscription = AlloySubscribeLogsRequest::new()
         .address(AlloyAddress::from_str("0xc22834581ebc8527d974f8a1c97e1bea4ef910bc")?)
         .from_block(2087031)
-        .events(vec!["ProxyCreation(address,address)"])
-        .send()?;
+        .events(vec!["ProxyCreation(address,address)"]);
+
+    provider.subscribe_logs(
+        ProviderMethod::SubscribeLogs(safe_creation_subscription),
+        Box::new(move |event: Vec<u8>| {
+            let log: ValueOrArray<AlloyLog> = serde_json::from_slice(&event).unwrap();
+            println!("log from our closure: {:?}", log);
+        }),
+    );
 
     // http::bind_http_path("/", true, false).unwrap();
     // http::bind_http_path("/safe", true, false).unwrap();
@@ -127,27 +138,46 @@ fn main(our: Address, mut state: State) -> Result<()> {
 
     // println!("Hello from Safe! {:?}", our);
 
-
     loop {
         match await_message() {
-            Err(e) => {
-                // println!("Error: {:?}", e);
-                continue;
+            Ok(msg) => {
+
+                println!("got a message");
+
+                match msg.is_request() {
+                    true => handle_request(&our, &msg, &mut state, &mut provider)?,
+                    false => handle_response(&our, &msg, &mut state)?
+                }
+                let _ = set_state(&bincode::serialize(&state).unwrap());
             }
+            Err(e) => continue,
             _ => {}
-            // Ok(msg) => match handle_request(&our, &msg, &mut state) {
-            //     Ok(()) => { 
-            //         let _ = set_state(&bincode::serialize(&state).unwrap());
-            //         continue;
-            //     }
-            //     Err(e) => println!("Error: {:?}", e),
-            // },
         }
     }
     Ok(())
 }
 
-fn handle_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+fn handle_response(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+
+    println!("we got a response message {:?}", msg);
+    Ok(())
+
+}
+
+fn handle_request(our: &Address, msg: &Message, state: &mut State, provider: &mut Provider) -> anyhow::Result<()> {
+
+    match serde_json::from_slice::<EthProviderRequests>(msg.body())? {
+        EthProviderRequests::Test => {
+            println!("test");
+
+            provider.closures.get_mut(&1).unwrap()(msg.body().to_vec());
+
+            let closure: &mut Box<dyn FnMut(Vec<u8>) + Send> = provider.closures.get_mut(&1).unwrap();
+            closure(msg.body().to_vec());
+
+        }
+        _ => {}
+    }
 
     // if !msg.is_request() {
     //     return Ok(());
