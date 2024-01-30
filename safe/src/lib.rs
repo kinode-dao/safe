@@ -1,4 +1,4 @@
-use alloy_sol_types::{sol, SolEvent};
+use alloy_sol_types::{sol, SolEvent, SolCall};
 use anyhow::Result;
 use serde::{Deserialize, Serialize, };
 use std::collections::HashSet;
@@ -10,6 +10,7 @@ use kinode_process_lib::{
 };
 use kinode_process_lib::eth_alloy::{
     Address as AlloyAddress,
+    AlloyCallRequest,
     AlloyLog,
     AlloySubscribeLogsRequest,
     EthProviderRequests,
@@ -17,9 +18,9 @@ use kinode_process_lib::eth_alloy::{
     ProviderMethod,
     ValueOrArray,
 };
-use std::sync::{Arc, Mutex};
 use std::cell::RefCell;
-use std::borrow::BorrowMut;
+
+use crate::SafeL2::getOwnersCall;
 
 wit_bindgen::generate!({
     path: "wit",
@@ -29,6 +30,7 @@ wit_bindgen::generate!({
     },
 });
 
+sol!(SafeL2, "./SafeL2.json");
 sol! {
     event ProxyCreation(address proxy, address singleton);
 }
@@ -91,6 +93,13 @@ struct Component;
 impl Guest for Component {
     fn init (our: String) {
 
+        let owner_call = SafeL2::getOwnersCall{ };
+
+        println!("Hello from Safe! {:?}!",owner_call.abi_encode());
+        println!("Hello from Safe! {:?}!",String::from_utf8(owner_call.abi_encode()));
+        println!("Hello from Safe! {:?}!",SafeL2::getOwnersCall::SELECTOR);
+        println!("Hello from Safe! {:?}!",SafeL2::getOwnersCall::SIGNATURE);
+
         let our = Address::from_str(&our).unwrap();
 
         let state = match get_state() {
@@ -127,16 +136,16 @@ fn main(our: Address, mut state: State) -> Result<()> {
         }),
     );
 
-    // http::bind_http_path("/", true, false).unwrap();
-    // http::bind_http_path("/safe", true, false).unwrap();
-    // http::bind_http_path("/safe/delegate", true, false).unwrap();
-    // http::bind_http_path("/safe/peer", true, false).unwrap();
-    // http::bind_http_path("/safe/send", true, false).unwrap();
-    // http::bind_http_path("/safe/signer", true, false).unwrap();
-    // http::bind_http_path("/safes", true, false).unwrap();
-    // http::bind_ws_path("/", true, false).unwrap();
+    http::bind_http_path("/", true, false).unwrap();
+    http::bind_http_path("/safe", true, false).unwrap();
+    http::bind_http_path("/safe/delegate", true, false).unwrap();
+    http::bind_http_path("/safe/peer", true, false).unwrap();
+    http::bind_http_path("/safe/send", true, false).unwrap();
+    http::bind_http_path("/safe/signer", true, false).unwrap();
+    http::bind_http_path("/safes", true, false).unwrap();
+    http::bind_ws_path("/", true, false).unwrap();
 
-    // println!("Hello from Safe! {:?}", our);
+    println!("Hello from Safe! {:?}", our);
 
     loop {
         match await_message() {
@@ -168,6 +177,34 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State, provider: &mu
 
     println!("handling request {:?}", msg);
 
+    if !msg.is_request() {
+        return Ok(());
+    }
+
+    if  msg.source().node != our.node {
+            let _ = handle_p2p_request(our, msg, state);
+    } else if
+        msg.source().node == our.node && 
+        msg.source().process == "terminal:terminal:nectar" {
+            let _ = handle_terminal_request(msg);
+    } else if 
+        msg.source().node == our.node &&
+        msg.source().process == "http_server:sys:nectar" {
+
+            println!("1");
+            let _ = handle_http_request(our, msg, state);
+    } else if
+        msg.source().node == our.node &&
+        msg.source().process == "eth:sys:nectar" {
+            let _ = handle_eth_request(our, msg, state, provider);
+    }
+
+    Ok(())
+
+}
+
+fn handle_eth_request(our: &Address, msg: &Message, state: &mut State, provider: &mut Provider) -> anyhow::Result<()> {
+
     match serde_json::from_slice::<EthProviderRequests>(msg.body())? {
         EthProviderRequests::RpcResponse(rpc_response) => {
             println!("response.... {:?}", rpc_response);
@@ -188,285 +225,253 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State, provider: &mu
         _ => {}
     }
 
-    // if !msg.is_request() {
-    //     return Ok(());
-    // }
-
-    // if  msg.source().node != our.node {
-    //         let _ = handle_p2p_request(our, msg, state);
-    // } else if
-    //     msg.source().node == our.node && 
-    //     msg.source().process == "terminal:terminal:nectar" {
-    //         let _ = handle_terminal_request(msg);
-    // } else if 
-    //     msg.source().node == our.node &&
-    //     msg.source().process == "http_server:sys:nectar" {
-
-    //         println!("1");
-    //         let _ = handle_http_request(our, msg, state);
-    // } else if
-    //     msg.source().node == our.node &&
-    //     msg.source().process == "eth:sys:nectar" {
-    //         let _ = handle_eth_request(our, msg, state);
-    // }
-
     Ok(())
 
 }
 
-// fn handle_eth_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+fn handle_p2p_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
 
-//     match serde_json::from_slice::<IndexerActions>(msg.body())? {
-//         _ => {}
-//     }
+    println!("handling p2p request");
 
-//     Ok(())
+    match serde_json::from_slice::<SafeActions>(msg.body())? {
+        SafeActions::AddSafe(AddSafe{ safe }) => {
+            println!("add safe: {:?}", safe);
 
-// }
+            match state.safes.entry(safe.address) {
+                Entry::Vacant(entry) => {
 
-// fn handle_p2p_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+                    entry.insert(safe.clone());
 
-//     println!("handling p2p request");
+                    Request::new()
+                        .target((&our.node, "http_server", "sys", "nectar"))
+                        .body(serde_json::to_vec(
+                            &http::HttpServerRequest::WebSocketPush {
+                                channel_id: state.ws_channel,
+                                message_type: http::WsMessageType::Binary,
+                            },
+                        )?)
+                        .blob(LazyLoadBlob {
+                            mime: Some("application/json".to_string()),
+                            bytes: serde_json::json!({"safe": safe}).to_string().into_bytes()
+                        })
+                        .send()?;
+                }
+                Entry::Occupied(entry) => {
 
-//     match serde_json::from_slice::<SafeActions>(msg.body())? {
-//         SafeActions::AddSafe(AddSafe{ safe }) => {
-//             println!("add safe: {:?}", safe);
+                }
+            }
 
-//             match state.safes.entry(safe.address) {
-//                 Entry::Vacant(entry) => {
+        }
+        SafeActions::AddPeer(AddPeer{ safe, peer }) => {
+            println!("add peer: {:?} {:?}", safe, peer);
+        }
+    }
 
-//                     entry.insert(safe.clone());
+    Ok(())
+}
 
-//                     Request::new()
-//                         .target((&our.node, "http_server", "sys", "nectar"))
-//                         .body(serde_json::to_vec(
-//                             &http::HttpServerRequest::WebSocketPush {
-//                                 channel_id: state.ws_channel,
-//                                 message_type: http::WsMessageType::Binary,
-//                             },
-//                         )?)
-//                         .blob(LazyLoadBlob {
-//                             mime: Some("application/json".to_string()),
-//                             bytes: serde_json::json!({"safe": safe}).to_string().into_bytes()
-//                         })
-//                         .send()?;
-//                 }
-//                 Entry::Occupied(entry) => {
+fn handle_terminal_request(msg: &Message) -> anyhow::Result<()> {
+    println!("terminal message: {:?}", msg);
+    Ok(())
+}
 
-//                 }
-//             }
+fn handle_http_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
 
-//         }
-//         SafeActions::AddPeer(AddPeer{ safe, peer }) => {
-//             println!("add peer: {:?} {:?}", safe, peer);
-//         }
-//     }
+    println!("handling http request");
 
-//     Ok(())
-// }
+    match serde_json::from_slice::<http::HttpServerRequest>(msg.body())? {
+        http::HttpServerRequest::Http(ref incoming) => {
+            match handle_http_methods(our, state, incoming) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    http::send_response(
+                        http::StatusCode::SERVICE_UNAVAILABLE,
+                        None,
+                        "Service Unavailable".to_string().as_bytes().to_vec(),
+                    )
+                }
+            }
+        }
+        http::HttpServerRequest::WebSocketOpen { path, channel_id } => {
+            state.ws_channel = channel_id;
+            Ok(())
+        }
+        http::HttpServerRequest::WebSocketClose (channel_id) => {
+            Ok(())
+        }
+        http::HttpServerRequest::WebSocketPush { .. } => {
+            Ok(())
+        }
+        _ => {
+            Ok(())
+        }
+    }
 
-// fn handle_terminal_request(msg: &Message) -> anyhow::Result<()> {
-//     println!("terminal message: {:?}", msg);
-//     Ok(())
-// }
+}
 
-// fn handle_http_request(our: &Address, msg: &Message, state: &mut State) -> anyhow::Result<()> {
+fn handle_http_methods(
+    our: &Address, 
+    state: &mut State, 
+    http_request: &http::IncomingHttpRequest,
+) -> anyhow::Result<()> {
 
-//     println!("handling http request");
+    if let Ok(path) = http_request.path() {
+        println!("http path: {:?}, method: {:?}", path, http_request.method());
+        match &path[..] {
+            "" => handle_http_slash(our, state, http_request),
+            "safe" => handle_http_safe(our, state, http_request),
+            "safes" => handle_http_safes(our, state, http_request),
+            "safe/delegate" => handle_http_safe_delegate(our, state, http_request),
+            "safe/peer" => handle_http_safe_peer(our, state, http_request),
+            "safe/send" => handle_http_safe_send(our, state, http_request),
+            "safe/signer" => handle_http_safe_signer(our, state, http_request),
+            &_ => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![])
+        }
+    } else {
+        Ok(())
+    }
 
-//     match serde_json::from_slice::<http::HttpServerRequest>(msg.body())? {
-//         http::HttpServerRequest::Http(ref incoming) => {
-//             match handle_http_methods(our, state, incoming) {
-//                 Ok(()) => Ok(()),
-//                 Err(_) => {
-//                     http::send_response(
-//                         http::StatusCode::SERVICE_UNAVAILABLE,
-//                         None,
-//                         "Service Unavailable".to_string().as_bytes().to_vec(),
-//                     )
-//                 }
-//             }
-//         }
-//         http::HttpServerRequest::WebSocketOpen { path, channel_id } => {
-//             state.ws_channel = channel_id;
-//             Ok(())
-//         }
-//         http::HttpServerRequest::WebSocketClose (channel_id) => {
-//             Ok(())
-//         }
-//         http::HttpServerRequest::WebSocketPush { .. } => {
-//             Ok(())
-//         }
-//         _ => {
-//             Ok(())
-//         }
-//     }
+}
 
-// }
+fn handle_http_slash(
+    our: &Address,
+    state: &mut State,
+    http_request: &http::IncomingHttpRequest,
+) -> anyhow::Result<()> {
 
-// fn handle_http_methods(
-//     our: &Address, 
-//     state: &mut State, 
-//     http_request: &http::IncomingHttpRequest,
-// ) -> anyhow::Result<()> {
+    match http_request.method()?.as_str() {
+        // on GET: give the frontend all of our active games
+        "GET" => {
+            println!("GET!");
+            let _ = http::send_response(http::StatusCode::OK, None, vec![]);
+            Ok(())
+        }
+        "POST" => {
+            println!("POST!");
+            Ok(())
+        }
+        "PUT" => {
+            println!("PUT!");
+            Ok(())
+        }
+        "DELETE" => {
+            println!("DELETE!");
+            Ok(())
+        }
+        _ => {
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+            Ok(())
+        }
+    }
 
-//     if let Ok(path) = http_request.path() {
-//         println!("http path: {:?}, method: {:?}", path, http_request.method);
-//         match &path[..] {
-//             "" => handle_http_slash(our, state, http_request),
-//             "safe" => handle_http_safe(our, state, http_request),
-//             "safes" => handle_http_safes(our, state, http_request),
-//             "safe/delegate" => handle_http_safe_delegate(our, state, http_request),
-//             "safe/peer" => handle_http_safe_peer(our, state, http_request),
-//             "safe/send" => handle_http_safe_send(our, state, http_request),
-//             "safe/signer" => handle_http_safe_signer(our, state, http_request),
-//             &_ => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![])
-//         }
-//     } else {
-//         Ok(())
-//     }
+}
 
-// }
+fn handle_http_safe(
+    our: &Address, 
+    state: &mut State, 
+    http_request: &http::IncomingHttpRequest
+) -> anyhow::Result<()> { 
 
-// fn handle_http_slash(
-//     our: &Address,
-//     state: &mut State,
-//     http_request: &http::IncomingHttpRequest,
-// ) -> anyhow::Result<()> {
+    println!("handling http_safe");
 
-//     match http_request.method.as_str() {
-//         // on GET: give the frontend all of our active games
-//         "GET" => {
-//             println!("GET!");
-//             let _ = http::send_response(http::StatusCode::OK, None, vec![]);
-//             Ok(())
-//         }
-//         "POST" => {
-//             println!("POST!");
-//             Ok(())
-//         }
-//         "PUT" => {
-//             println!("PUT!");
-//             Ok(())
-//         }
-//         "DELETE" => {
-//             println!("DELETE!");
-//             Ok(())
-//         }
-//         _ => {
-//             let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
-//             Ok(())
-//         }
-//     }
+    match http_request.method()?.as_str() {
+        "GET" => {
+            println!("GET!");
+            let _ = http::send_response(http::StatusCode::OK, None, vec![]);
+            Ok(())
+        }
+        "POST" => {
+            let Some(blob) = get_blob() else {
+                return http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+            };
 
-// }
+            // let AddSafe { safe } = serde_json::from_slice::<AddSafe>(&blob.bytes)?;
+            let AddSafe { safe } = serde_json::from_slice::<AddSafe>(&blob.bytes).unwrap_or_else(|err| {
+                println!("Error while parsing JSON: {:?}", err);
+                std::process::exit(1);
+            });
 
-// fn handle_http_safe(
-//     our: &Address, 
-//     state: &mut State, 
-//     http_request: &http::IncomingHttpRequest
-// ) -> anyhow::Result<()> { 
+            println!("Add Safe: {:?}", safe);
 
-//     println!("handling http_safe");
+            match state.safes.entry(safe.address) {
+                Entry::Vacant(v) => {
+                    v.insert(safe);
+                    let _ = http::send_response(http::StatusCode::OK, None, vec![]);
+                }
+                Entry::Occupied(_) => {
+                    let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+                }
+            }
 
-//     match http_request.method.as_str() {
-//         "GET" => {
-//             println!("GET!");
-//             let _ = http::send_response(http::StatusCode::OK, None, vec![]);
-//             Ok(())
-//         }
-//         "POST" => {
-//             let Some(blob) = get_blob() else {
-//                 return http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
-//             };
+            Ok(())
+        }
+        "PUT" => {
+            println!("PUT!");
+            Ok(())
+        }
+        "DELETE" => {
+            println!("DELETE!");
+            Ok(())
+        }
+        _ => {
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+            Ok(())
+        }
+    }
 
-//             // let AddSafe { safe } = serde_json::from_slice::<AddSafe>(&blob.bytes)?;
-//             let AddSafe { safe } = serde_json::from_slice::<AddSafe>(&blob.bytes).unwrap_or_else(|err| {
-//                 println!("Error while parsing JSON: {:?}", err);
-//                 std::process::exit(1);
-//             });
+}
 
-//             println!("Add Safe: {:?}", safe);
+fn handle_http_safes(
+    our: &Address, 
+    state: &mut State, 
+    http_request: &http::IncomingHttpRequest
+) -> anyhow::Result<()> { 
 
-//             match state.safes.entry(safe.address) {
-//                 Entry::Vacant(v) => {
-//                     v.insert(safe);
-//                     let _ = http::send_response(http::StatusCode::OK, None, vec![]);
-//                 }
-//                 Entry::Occupied(_) => {
-//                     let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
-//                 }
-//             }
+    println!("handling http_safes");
 
-//             Ok(())
-//         }
-//         "PUT" => {
-//             println!("PUT!");
-//             Ok(())
-//         }
-//         "DELETE" => {
-//             println!("DELETE!");
-//             Ok(())
-//         }
-//         _ => {
-//             let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
-//             Ok(())
-//         }
-//     }
+    match http_request.method()?.as_str() {
+        "GET" => http::send_response(http::StatusCode::OK, None, serde_json::to_vec(&state.safes)?),
+        _ => http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![])
+    }
+}
 
-// }
+fn handle_http_safe_peer(
+    our: &Address, 
+    state: &mut State, 
+    http_request: &http::IncomingHttpRequest
+) -> anyhow::Result<()> { 
+    println!("safe peer {}", http_request.method()?.as_str());
+    match http_request.method()?.as_str() {
+        "POST" => {
+            let blob = get_blob().unwrap();
 
-// fn handle_http_safes(
-//     our: &Address, 
-//     state: &mut State, 
-//     http_request: &http::IncomingHttpRequest
-// ) -> anyhow::Result<()> { 
+            let AddPeer{ peer, safe } = serde_json::from_slice::<AddPeer>(&blob.bytes)?;
 
-//     println!("handling http_safes");
+            let _ = match state.safes.entry(safe) {
+                Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
+                Entry::Occupied(mut o) => {
 
-//     match http_request.method.as_str() {
-//         "GET" => http::send_response(http::StatusCode::OK, None, serde_json::to_vec(&state.safes)?),
-//         _ => http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![])
-//     }
-// }
+                    let saved_safe = o.get_mut();
+                    saved_safe.peers.get_or_insert(HashSet::new()).insert(peer.clone());
 
-// fn handle_http_safe_peer(
-//     our: &Address, 
-//     state: &mut State, 
-//     http_request: &http::IncomingHttpRequest
-// ) -> anyhow::Result<()> { 
-//     println!("safe peer {}", http_request.method.as_str());
-//     match http_request.method.as_str() {
-//         "POST" => {
-//             let blob = get_blob().unwrap();
+                    Request::new()
+                        .target(Address{node:peer, process:our.process.clone()})
+                        .body(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{ safe: saved_safe.clone() }))?)
+                        .send()?;
 
-//             let AddPeer{ peer, safe } = serde_json::from_slice::<AddPeer>(&blob.bytes)?;
+                    http::send_response(http::StatusCode::OK, None, vec![])
 
-//             let _ = match state.safes.entry(safe) {
-//                 Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
-//                 Entry::Occupied(mut o) => {
+                }
+            };
+        }
+        _ => {
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+        }
+    }
+    Ok(()) 
+}
 
-//                     let saved_safe = o.get_mut();
-//                     saved_safe.peers.get_or_insert(HashSet::new()).insert(peer.clone());
-
-//                     Request::new()
-//                         .target(Address{node:peer, process:our.process.clone()})
-//                         .body(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{ safe: saved_safe.clone() }))?)
-//                         .send()?;
-
-//                     http::send_response(http::StatusCode::OK, None, vec![])
-
-//                 }
-//             };
-//         }
-//         _ => {
-//             let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
-//         }
-//     }
-//     Ok(()) 
-// }
-
-// fn handle_http_safe_delegate(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
-// fn handle_http_safe_send(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
-// fn handle_http_safe_signer(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
+fn handle_http_safe_delegate(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
+fn handle_http_safe_send(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
+fn handle_http_safe_signer(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
 
