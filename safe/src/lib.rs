@@ -184,11 +184,6 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State, provider: &mu
         EthProviderRequests::Test => {
             println!("test");
 
-            provider.closures.get_mut(&1).unwrap()(msg.body().to_vec());
-
-            let closure: &mut Box<dyn FnMut(Vec<u8>) + Send> = provider.closures.get_mut(&1).unwrap();
-            closure(msg.body().to_vec());
-
         }
         _ => {}
     }
