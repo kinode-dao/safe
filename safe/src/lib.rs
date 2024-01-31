@@ -10,17 +10,14 @@ use kinode_process_lib::{
 };
 use kinode_process_lib::eth_alloy::{
     Address as AlloyAddress,
-    AlloyCallRequest,
-    AlloyLog,
-    AlloySubscribeLogsRequest,
-    EthProviderRequests,
+    Log,
+    EthProviderRequest,
+    Filter,
     Provider,
-    ProviderMethod,
+    RpcRequest,
+    RpcResponse,
     ValueOrArray,
 };
-use std::cell::RefCell;
-
-use crate::SafeL2::getOwnersCall;
 
 wit_bindgen::generate!({
     path: "wit",
@@ -121,18 +118,36 @@ impl Guest for Component {
 
 fn main(our: Address, mut state: State) -> Result<()> {
 
-    let mut provider = Provider { closures: HashMap::new(), count: 0 };
+    let mut provider = Provider::<State> { handlers: HashMap::new(), count: 0 };
 
-    let safe_creation_subscription = AlloySubscribeLogsRequest::new()
+    let sub_filter = Filter::new()
         .address(AlloyAddress::from_str("0xc22834581ebc8527d974f8a1c97e1bea4ef910bc")?)
         .from_block(2087031)
         .events(vec!["ProxyCreation(address,address)"]);
 
     provider.subscribe_logs(
-        ProviderMethod::SubscribeLogs(safe_creation_subscription),
-        Box::new(move |event: Vec<u8>| {
-            let log: ValueOrArray<AlloyLog> = serde_json::from_slice(&event).unwrap();
-            println!("log from our closure: {:?}", log);
+        sub_filter,
+Box::new(move |event: Vec<u8>, state: &mut State| {
+            let log: ValueOrArray<Log> = serde_json::from_slice(&event).unwrap();
+
+            let logs = match log {
+                ValueOrArray::Value(log) => {
+                    println!("Log: {:?}", log);
+                    vec![log]
+                },
+                ValueOrArray::Array(logs) => logs,
+            };
+
+            for log in logs {
+
+                let decoded = ProxyCreation::abi_decode_data(&log.data, false).unwrap();
+
+                state.safe_blocks.insert(
+                    decoded.0,
+                    log.block_number.expect("REASON").to::<u64>(),
+                );
+
+            }
         }),
     );
 
@@ -150,8 +165,6 @@ fn main(our: Address, mut state: State) -> Result<()> {
     loop {
         match await_message() {
             Ok(msg) => {
-
-                println!("got a message");
 
                 match msg.is_request() {
                     true => handle_request(&our, &msg, &mut state, &mut provider)?,
@@ -173,29 +186,27 @@ fn handle_response(our: &Address, msg: &Message, state: &mut State) -> anyhow::R
 
 }
 
-fn handle_request(our: &Address, msg: &Message, state: &mut State, provider: &mut Provider) -> anyhow::Result<()> {
-
-    println!("handling request {:?}", msg);
+fn handle_request(our: &Address, msg: &Message, state: &mut State, provider: &mut Provider<State>) -> anyhow::Result<()> {
 
     if !msg.is_request() {
         return Ok(());
     }
 
+    println!("handling request {:?}", msg.source());
+
     if  msg.source().node != our.node {
             let _ = handle_p2p_request(our, msg, state);
     } else if
         msg.source().node == our.node && 
-        msg.source().process == "terminal:terminal:nectar" {
+        msg.source().process == "terminal:distro:sys" {
             let _ = handle_terminal_request(msg);
     } else if 
         msg.source().node == our.node &&
-        msg.source().process == "http_server:sys:nectar" {
-
-            println!("1");
+        msg.source().process == "http_server:distro:sys" {
             let _ = handle_http_request(our, msg, state);
     } else if
         msg.source().node == our.node &&
-        msg.source().process == "eth:sys:nectar" {
+        msg.source().process == "eth_provider:eth_provider:sys" {
             let _ = handle_eth_request(our, msg, state, provider);
     }
 
@@ -203,27 +214,25 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State, provider: &mu
 
 }
 
-fn handle_eth_request(our: &Address, msg: &Message, state: &mut State, provider: &mut Provider) -> anyhow::Result<()> {
+fn handle_eth_request(our: &Address, msg: &Message, state: &mut State, provider: &mut Provider<State>) -> anyhow::Result<()> {
 
-    match serde_json::from_slice::<EthProviderRequests>(msg.body())? {
-        EthProviderRequests::RpcResponse(rpc_response) => {
-            println!("response.... {:?}", rpc_response);
+    println!("handling eth request");
 
-            let closure_id = msg.metadata().unwrap().parse::<u64>().unwrap();
+    if let Ok(rpc_response) = serde_json::from_slice::<RpcResponse>(&msg.body()) {
 
-            provider.receive(closure_id, rpc_response.result.as_bytes().to_vec());
+        provider.receive(
+            msg.metadata().unwrap().parse::<u64>().unwrap(),
+            serde_json::to_vec(&rpc_response.result).unwrap(), 
+            state
+        );
+        
+    } else {
 
-        }
-        EthProviderRequests::RpcRequest(rpc_request) => {
-            println!("request.... {:?}", rpc_request);
+        println!("kns_indexer: got invalid message");
 
-        }
-        EthProviderRequests::Test => {
-            println!("test");
+    };
 
-        }
-        _ => {}
-    }
+    println!("after match");
 
     Ok(())
 
