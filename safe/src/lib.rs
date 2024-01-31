@@ -11,10 +11,8 @@ use kinode_process_lib::{
 use kinode_process_lib::eth_alloy::{
     Address as AlloyAddress,
     Log,
-    EthProviderRequest,
     Filter,
     Provider,
-    RpcRequest,
     RpcResponse,
     ValueOrArray,
 };
@@ -128,26 +126,30 @@ fn main(our: Address, mut state: State) -> Result<()> {
     provider.subscribe_logs(
         sub_filter,
 Box::new(move |event: Vec<u8>, state: &mut State| {
-            let log: ValueOrArray<Log> = serde_json::from_slice(&event).unwrap();
 
-            let logs = match log {
-                ValueOrArray::Value(log) => {
-                    println!("Log: {:?}", log);
-                    vec![log]
+            let logs: Vec<Log> = match serde_json::from_slice::<ValueOrArray<Log>>(&event) {
+                Ok(log) => match log {
+                    ValueOrArray::Value(log) => vec![log],
+                    ValueOrArray::Array(logs) => logs,
                 },
-                ValueOrArray::Array(logs) => logs,
+                Err(e) => {
+                    println!("Error: {:?}, {:?}", &event, e);
+                    return;
+                }
             };
 
             for log in logs {
-
-                let decoded = ProxyCreation::abi_decode_data(&log.data, false).unwrap();
+                let decoded = 
+                    ProxyCreation::abi_decode_data(&log.data, false).unwrap();
 
                 state.safe_blocks.insert(
                     decoded.0,
                     log.block_number.expect("REASON").to::<u64>(),
                 );
-
             }
+
+            println!("got all the logs {}", state.safe_blocks.len());
+
         }),
     );
 
@@ -216,9 +218,11 @@ fn handle_request(our: &Address, msg: &Message, state: &mut State, provider: &mu
 
 fn handle_eth_request(our: &Address, msg: &Message, state: &mut State, provider: &mut Provider<State>) -> anyhow::Result<()> {
 
-    println!("handling eth request");
+    println!("handling eth request {:?}", msg.body());
 
     if let Ok(rpc_response) = serde_json::from_slice::<RpcResponse>(&msg.body()) {
+
+        println!("handling the body {:?}, {}", &rpc_response, msg.metadata().unwrap().parse::<u64>().unwrap());
 
         provider.receive(
             msg.metadata().unwrap().parse::<u64>().unwrap(),
@@ -228,11 +232,9 @@ fn handle_eth_request(our: &Address, msg: &Message, state: &mut State, provider:
         
     } else {
 
-        println!("kns_indexer: got invalid message");
+        println!("safe: got invalid message");
 
     };
-
-    println!("after match");
 
     Ok(())
 
