@@ -329,13 +329,13 @@ fn handle_http_methods(
     if let Ok(path) = http_request.path() {
         println!("http path: {:?}, method: {:?}", path, http_request.method());
         match &path[..] {
-            "" => handle_http_slash(our, state, http_request),
-            "safe" => handle_http_safe(our, state, http_request),
-            "safes" => handle_http_safes(our, state, http_request),
-            "safe/delegate" => handle_http_safe_delegate(our, state, http_request),
-            "safe/peer" => handle_http_safe_peer(our, state, http_request),
-            "safe/send" => handle_http_safe_send(our, state, http_request),
-            "safe/signer" => handle_http_safe_signer(our, state, http_request),
+            "/" => handle_http_slash(our, state, http_request),
+            "/safe" => handle_http_safe(our, state, http_request),
+            "/safes" => handle_http_safes(our, state, http_request),
+            "/safe/delegate" => handle_http_safe_delegate(our, state, http_request),
+            "/safe/peer" => handle_http_safe_peer(our, state, http_request),
+            "/safe/send" => handle_http_safe_send(our, state, http_request),
+            "/safe/signer" => handle_http_safe_signer(our, state, http_request),
             &_ => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![])
         }
     } else {
