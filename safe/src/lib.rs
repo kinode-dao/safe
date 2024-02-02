@@ -36,19 +36,8 @@ sol! {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 enum SafeActions {
-    AddSafe(AddSafe),
-    AddPeer(AddPeer)
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct AddPeer {
-    safe: AlloyAddress,
-    peer: NodeId,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct AddSafe {
-    safe: Safe,
+    AddSafe(AlloyAddress),
+    AddPeer(AlloyAddress, NodeId),
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -72,6 +61,17 @@ struct Safe {
     txs: HashMap<U256, SafeTx>,
     tx_sigs: HashMap<U256, Vec<Bytes>>,
     threshold: U256,
+}
+
+impl Safe {
+
+    fn new(address: AlloyAddress) -> Self {
+        Safe {
+            address,
+            ..Default::default()
+        }
+    }
+
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -247,20 +247,22 @@ fn handle_p2p_request(
     println!("handling p2p request");
 
     match serde_json::from_slice::<SafeActions>(msg.body())? {
-        SafeActions::AddSafe(AddSafe{ safe }) => {
+        SafeActions::AddSafe(safe) => {
             println!("add safe: {:?}", safe);
 
-            match state.safes.entry(safe.address) {
+            match state.safes.entry(safe) {
                 Entry::Vacant(entry) => {
+
+                    entry.insert(Safe::new(safe.clone()));
+
+                    subscribe_to_safe(safe.clone(), state, provider)?;
 
                     if msg.source() != our {
 
-                        state.peers.safe_to_nodes.get_mut(&safe.address).unwrap().insert(msg.source().node.clone());
-                        state.peers.node_to_safes.get_mut(&msg.source().node.clone()).unwrap().insert(safe.address);
+                        state.peers.safe_to_nodes.get_mut(&safe).unwrap().insert(msg.source().node.clone());
+                        state.peers.node_to_safes.get_mut(&msg.source().node.clone()).unwrap().insert(safe);
 
                     }
-
-                    entry.insert(safe.clone());
 
                     Request::new()
                         .target((&our.node, "http_server", "distro", "sys"))
@@ -272,7 +274,7 @@ fn handle_p2p_request(
                         )?)
                         .blob(LazyLoadBlob {
                             mime: Some("application/json".to_string()),
-                            bytes: serde_json::json!({"safe": safe}).to_string().into_bytes()
+                            bytes: serde_json::json!({"safe":safe}).to_string().into_bytes()
                         })
                         .send()?;
                 }
@@ -282,7 +284,7 @@ fn handle_p2p_request(
             }
 
         }
-        SafeActions::AddPeer(AddPeer{ safe, peer }) => {
+        SafeActions::AddPeer(safe, peer) => {
             println!("add peer: {:?} {:?}", safe, peer);
         }
     }
@@ -413,112 +415,21 @@ fn handle_http_safe(
                 return http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
             };
 
-            // let AddSafe { safe } = serde_json::from_slice::<AddSafe>(&blob.bytes)?;
-            let AddSafe { safe } = serde_json::from_slice::<AddSafe>(&blob.bytes).unwrap_or_else(|err| {
-                println!("Error while parsing JSON: {:?}", err);
-                std::process::exit(1);
-            });
+            let safe = match serde_json::from_slice::<SafeActions>(&blob.bytes)? {
+                SafeActions::AddSafe(safe) => safe,
+                _ => std::process::exit(1),
+            };
 
-            println!("Add Safe: {:?}", safe);
-
-            match state.safes.entry(safe.address) {
+            match state.safes.entry(safe) {
                 Entry::Vacant(v) => {
-                    v.insert(safe.clone());
+                    v.insert(Safe::new(safe));
+                    subscribe_to_safe(safe, state, provider)?;
                     let _ = http::send_response(http::StatusCode::OK, None, vec![]);
                 }
                 Entry::Occupied(_) => {
                     let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
                 }
             }
-
-            let mut owners_call_request = CallRequest::default();
-            owners_call_request.to = Some(safe.address);
-            owners_call_request.input = CallInput::new(SafeL2::getOwnersCall::new(()).abi_encode().into());
-
-            provider.call(
-                owners_call_request,
-                Box::new(move |call: Vec<u8>, state: &mut State| {
-
-                    let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
-                    let decoded  = match SafeL2::getOwnersCall::abi_decode_returns(bytes, false) {
-                        Ok(decoded) => decoded,
-                        Err(e) => return
-                    };
-
-                    let safe = state.safes.get_mut(&safe.address.clone()).unwrap();
-
-                    for owner in decoded._0 {
-                        safe.owners.insert(owner);
-                    }
-
-                })
-            );
-
-            let mut get_threshold_request = CallRequest::default();
-            get_threshold_request.to = Some(safe.address);
-            get_threshold_request.input = CallInput::new(SafeL2::getThresholdCall::new(()).abi_encode().into());
-
-            provider.call(
-                get_threshold_request,
-                Box::new(move |call: Vec<u8>, state: &mut State| {
-
-                    let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
-                    let decoded  = match SafeL2::getThresholdCall::abi_decode_returns(bytes, false) {
-                        Ok(decoded) => decoded,
-                        Err(e) => return
-                    };
-
-                    let safe = state.safes.get_mut(&safe.address.clone()).unwrap();
-                    safe.threshold = decoded._0;
-
-                })
-            );
-
-
-            // let safe_execution_filter = Filter::new()
-            //     .address(safe.address)
-            //     .from_block(0)
-            //     .events(vec![SafeL2::ExecutionSuccess::SIGNATURE]);
-
-            // provider.subscribe_logs(
-            //     safe_execution_filter,
-            //     Box::new(move |event: Vec<u8>, state: &mut State| {
-            //         let logs: Vec<Log> = match serde_json::from_slice::<ValueOrArray<Log>>(&event) {
-            //             Ok(log) => match log {
-            //                 ValueOrArray::Value(log) => vec![log],
-            //                 ValueOrArray::Array(logs) => logs,
-            //             },
-            //             Err(e) => {
-            //                 println!("Error: {:?}, {:?}", &event, e);
-            //                 return;
-            //             }
-            //         };
-
-            //         for log in logs {
-            //             let decoded = SafeL2::ExecutionSuccess::abi_decode_data(&log.data, false).unwrap();
-            //             let safe_tx = state.safes.get_mut(&log.address).unwrap().txs.get(&decoded.0).unwrap();
-            //             let safe_tx_sig = state.safes.get_mut(&log.address).unwrap().tx_sigs.get(&decoded.0).unwrap();
-            //             let safe_tx = SafeTx {
-            //                 to: safe_tx.to.clone(),
-            //                 value: safe_tx.value,
-            //                 data: safe_tx.data.clone(),
-            //                 operation: safe_tx.operation,
-            //                 safe_tx_gas: safe_tx.safe_tx_gas,
-            //                 base_gas: safe_tx.base_gas,
-            //                 gas_price: safe_tx.gas_price,
-            //                 gas_token: safe_tx.gas_token.clone(),
-            //                 refund_receiver: safe_tx.refund_receiver.clone(),
-            //                 nonce: safe_tx.nonce,
-            //             };
-            //             let safe_tx_sig = safe_tx_sig.clone();
-            //             let _ = Request::new()
-            //                 .target(Address{node: "eth_provider", process: "eth_provider",})
-            //                 .body(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{ safe: safe.clone() }))?)
-            //                 .send();
-            //         }
-            //     }),
-            // );
-
 
             Ok(())
         }
@@ -561,7 +472,10 @@ fn handle_http_safe_peer(
     match http_request.method()?.as_str() {
         "POST" => {
 
-            let AddPeer{ peer, safe } = serde_json::from_slice::<AddPeer>(&get_blob().unwrap().bytes)?;
+            let (safe, peer) = match serde_json::from_slice::<SafeActions>(&get_blob().unwrap().bytes)? {
+                SafeActions::AddPeer(safe, peer) => (safe, peer),
+                _ => std::process::exit(1),
+            };
 
             let _ = match state.safes.entry(safe) {
                 Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
@@ -572,7 +486,7 @@ fn handle_http_safe_peer(
 
                     Request::new()
                         .target(Address{node:peer, process:our.process.clone()})
-                        .body(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{ safe: o.get().clone() }))?)
+                        .body(serde_json::to_vec(&SafeActions::AddSafe(safe))?)
                         .send()?;
 
                     http::send_response(http::StatusCode::OK, None, vec![])
@@ -591,3 +505,95 @@ fn handle_http_safe_delegate(our: &Address, state: &mut State, http_request: &ht
 fn handle_http_safe_send(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
 fn handle_http_safe_signer(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
 
+fn subscribe_to_safe(safe: AlloyAddress, state: &mut State, provider: &mut Provider<State>) -> anyhow::Result<()> {
+
+    let mut owners_call_request = CallRequest::default();
+    owners_call_request.to = Some(safe);
+    owners_call_request.input = CallInput::new(SafeL2::getOwnersCall::new(()).abi_encode().into());
+
+    provider.call(
+        owners_call_request,
+        Box::new(move |call: Vec<u8>, state: &mut State| {
+
+            let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
+            let decoded  = match SafeL2::getOwnersCall::abi_decode_returns(bytes, false) {
+                Ok(decoded) => decoded,
+                Err(e) => return
+            };
+
+            let safe = state.safes.get_mut(&safe.clone()).unwrap();
+
+            for owner in decoded._0 {
+                safe.owners.insert(owner);
+            }
+
+        })
+    );
+
+    let mut get_threshold_request = CallRequest::default();
+    get_threshold_request.to = Some(safe);
+    get_threshold_request.input = CallInput::new(SafeL2::getThresholdCall::new(()).abi_encode().into());
+
+    provider.call(
+        get_threshold_request,
+        Box::new(move |call: Vec<u8>, state: &mut State| {
+
+            let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
+            let decoded  = match SafeL2::getThresholdCall::abi_decode_returns(bytes, false) {
+                Ok(decoded) => decoded,
+                Err(e) => return
+            };
+
+            let safe = state.safes.get_mut(&safe.clone()).unwrap();
+            safe.threshold = decoded._0;
+
+        })
+    );
+
+    // let safe_execution_filter = Filter::new()
+    //     .address(safe.address)
+    //     .from_block(0)
+    //     .events(vec![SafeL2::ExecutionSuccess::SIGNATURE]);
+
+    // provider.subscribe_logs(
+    //     safe_execution_filter,
+    //     Box::new(move |event: Vec<u8>, state: &mut State| {
+    //         let logs: Vec<Log> = match serde_json::from_slice::<ValueOrArray<Log>>(&event) {
+    //             Ok(log) => match log {
+    //                 ValueOrArray::Value(log) => vec![log],
+    //                 ValueOrArray::Array(logs) => logs,
+    //             },
+    //             Err(e) => {
+    //                 println!("Error: {:?}, {:?}", &event, e);
+    //                 return;
+    //             }
+    //         };
+
+    //         for log in logs {
+    //             let decoded = SafeL2::ExecutionSuccess::abi_decode_data(&log.data, false).unwrap();
+    //             let safe_tx = state.safes.get_mut(&log.address).unwrap().txs.get(&decoded.0).unwrap();
+    //             let safe_tx_sig = state.safes.get_mut(&log.address).unwrap().tx_sigs.get(&decoded.0).unwrap();
+    //             let safe_tx = SafeTx {
+    //                 to: safe_tx.to.clone(),
+    //                 value: safe_tx.value,
+    //                 data: safe_tx.data.clone(),
+    //                 operation: safe_tx.operation,
+    //                 safe_tx_gas: safe_tx.safe_tx_gas,
+    //                 base_gas: safe_tx.base_gas,
+    //                 gas_price: safe_tx.gas_price,
+    //                 gas_token: safe_tx.gas_token.clone(),
+    //                 refund_receiver: safe_tx.refund_receiver.clone(),
+    //                 nonce: safe_tx.nonce,
+    //             };
+    //             let safe_tx_sig = safe_tx_sig.clone();
+    //             let _ = Request::new()
+    //                 .target(Address{node: "eth_provider", process: "eth_provider",})
+    //                 .body(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{ safe: safe.clone() }))?)
+    //                 .send();
+    //         }
+    //     }),
+    // );
+
+    Ok(())
+
+}
