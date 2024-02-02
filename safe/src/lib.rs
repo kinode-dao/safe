@@ -11,6 +11,7 @@ use kinode_process_lib::{
 use kinode_process_lib::eth_alloy::{
     U256,
     Address as AlloyAddress,
+    BlockNumberOrTag,
     Bytes,
     CallInput,
     CallRequest,
@@ -248,8 +249,6 @@ fn handle_p2p_request(
 
     match serde_json::from_slice::<SafeActions>(msg.body())? {
         SafeActions::AddSafe(safe) => {
-            println!("add safe: {:?}", safe);
-
             match state.safes.entry(safe) {
                 Entry::Vacant(entry) => {
 
@@ -266,17 +265,10 @@ fn handle_p2p_request(
 
                     Request::new()
                         .target((&our.node, "http_server", "distro", "sys"))
-                        .body(serde_json::to_vec(
-                            &http::HttpServerRequest::WebSocketPush {
-                                channel_id: state.ws_channel,
-                                message_type: http::WsMessageType::Binary,
-                            },
-                        )?)
-                        .blob(LazyLoadBlob {
-                            mime: Some("application/json".to_string()),
-                            bytes: serde_json::json!({"safe":safe}).to_string().into_bytes()
-                        })
+                        .body(websocket_body(state.ws_channel)?)
+                        .blob(websocket_blob(serde_json::json!({"safe":safe})))
                         .send()?;
+
                 }
                 Entry::Occupied(entry) => {
 
@@ -518,7 +510,7 @@ fn subscribe_to_safe(safe: AlloyAddress, state: &mut State, provider: &mut Provi
             let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
             let decoded  = match SafeL2::getOwnersCall::abi_decode_returns(bytes, false) {
                 Ok(decoded) => decoded,
-                Err(e) => return
+                Err(_) => return
             };
 
             let safe = state.safes.get_mut(&safe.clone()).unwrap();
@@ -541,7 +533,7 @@ fn subscribe_to_safe(safe: AlloyAddress, state: &mut State, provider: &mut Provi
             let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
             let decoded  = match SafeL2::getThresholdCall::abi_decode_returns(bytes, false) {
                 Ok(decoded) => decoded,
-                Err(e) => return
+                Err(_) => return
             };
 
             let safe = state.safes.get_mut(&safe.clone()).unwrap();
@@ -550,50 +542,78 @@ fn subscribe_to_safe(safe: AlloyAddress, state: &mut State, provider: &mut Provi
         })
     );
 
-    // let safe_execution_filter = Filter::new()
-    //     .address(safe.address)
-    //     .from_block(0)
-    //     .events(vec![SafeL2::ExecutionSuccess::SIGNATURE]);
+    let added_owner_filter = Filter::new()
+        .address(safe.clone())
+        .from_block(BlockNumberOrTag::Latest)
+        .events(vec![SafeL2::AddedOwner::SIGNATURE]);
 
-    // provider.subscribe_logs(
-    //     safe_execution_filter,
-    //     Box::new(move |event: Vec<u8>, state: &mut State| {
-    //         let logs: Vec<Log> = match serde_json::from_slice::<ValueOrArray<Log>>(&event) {
-    //             Ok(log) => match log {
-    //                 ValueOrArray::Value(log) => vec![log],
-    //                 ValueOrArray::Array(logs) => logs,
-    //             },
-    //             Err(e) => {
-    //                 println!("Error: {:?}, {:?}", &event, e);
-    //                 return;
-    //             }
-    //         };
+    provider.subscribe_logs(
+        added_owner_filter,
+        Box::new(move |event: Vec<u8>, state: &mut State| {
 
-    //         for log in logs {
-    //             let decoded = SafeL2::ExecutionSuccess::abi_decode_data(&log.data, false).unwrap();
-    //             let safe_tx = state.safes.get_mut(&log.address).unwrap().txs.get(&decoded.0).unwrap();
-    //             let safe_tx_sig = state.safes.get_mut(&log.address).unwrap().tx_sigs.get(&decoded.0).unwrap();
-    //             let safe_tx = SafeTx {
-    //                 to: safe_tx.to.clone(),
-    //                 value: safe_tx.value,
-    //                 data: safe_tx.data.clone(),
-    //                 operation: safe_tx.operation,
-    //                 safe_tx_gas: safe_tx.safe_tx_gas,
-    //                 base_gas: safe_tx.base_gas,
-    //                 gas_price: safe_tx.gas_price,
-    //                 gas_token: safe_tx.gas_token.clone(),
-    //                 refund_receiver: safe_tx.refund_receiver.clone(),
-    //                 nonce: safe_tx.nonce,
-    //             };
-    //             let safe_tx_sig = safe_tx_sig.clone();
-    //             let _ = Request::new()
-    //                 .target(Address{node: "eth_provider", process: "eth_provider",})
-    //                 .body(serde_json::to_vec(&SafeActions::AddSafe(AddSafe{ safe: safe.clone() }))?)
-    //                 .send();
-    //         }
-    //     }),
-    // );
+            let logs: Vec<Log> = match serde_json::from_slice::<ValueOrArray<Log>>(&event) {
+                Ok(log) => match log {
+                    ValueOrArray::Value(log) => vec![log],
+                    ValueOrArray::Array(logs) => logs,
+                },
+                Err(e) => {
+                    println!("Error: {:?}, {:?}", &event, e);
+                    return;
+                }
+            };
+
+            for log in logs {
+                let safe = state.safes.get_mut(&log.address).unwrap();
+                safe.owners.insert(AlloyAddress::from_word(log.topics[1].into()));
+            }
+
+        }),
+    );
+
+    let removed_owner_filter = Filter::new()
+        .address(safe.clone())
+        .from_block(BlockNumberOrTag::Latest)
+        .events(vec![SafeL2::RemovedOwner::SIGNATURE]);
+
+    provider.subscribe_logs(
+        removed_owner_filter,
+        Box::new(move |event: Vec<u8>, state: &mut State| {
+
+            let logs: Vec<Log> = match serde_json::from_slice::<ValueOrArray<Log>>(&event) {
+                Ok(log) => match log {
+                    ValueOrArray::Value(log) => vec![log],
+                    ValueOrArray::Array(logs) => logs,
+                },
+                Err(e) => {
+                    println!("Error: {:?}, {:?}", &event, e);
+                    return;
+                }
+            };
+
+            for log in logs {
+                let safe = state.safes.get_mut(&log.address).unwrap();
+                safe.owners.remove(&AlloyAddress::from_word(log.topics[1].into()));
+            }
+
+        }),
+    );
 
     Ok(())
 
+}
+
+fn websocket_body(channel_id: u32) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec(
+        &http::HttpServerRequest::WebSocketPush {
+            channel_id,
+            message_type: http::WsMessageType::Binary,
+        }
+    )?)
+}
+
+fn websocket_blob(json: serde_json::Value) -> LazyLoadBlob {
+    LazyLoadBlob {
+        mime: Some("application/json".to_string()),
+        bytes: json.to_string().into()
+    }
 }
