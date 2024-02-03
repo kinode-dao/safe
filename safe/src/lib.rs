@@ -407,9 +407,10 @@ fn handle_http_safe(
                 return http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
             };
 
-            let safe = match serde_json::from_slice::<SafeActions>(&blob.bytes)? {
-                SafeActions::AddSafe(safe) => safe,
-                _ => std::process::exit(1),
+            let safe = match serde_json::from_slice::<SafeActions>(&blob.bytes) {
+                Ok(SafeActions::AddSafe(safe)) => safe,
+                Err(_) => std::process::exit(1),
+                _ => return Ok(()),
             };
 
             match state.safes.entry(safe) {
