@@ -263,7 +263,7 @@ fn handle_p2p_request(
                     Request::new()
                         .target((&our.node, "http_server", "distro", "sys"))
                         .body(websocket_body(state.ws_channel)?)
-                        .blob(websocket_blob(serde_json::json!({"safe":safe})))
+                        .blob(websocket_blob(serde_json::json!(&SafeActions::AddSafe(safe))))
                         .send()?;
 
                 }
@@ -613,6 +613,6 @@ fn websocket_body(channel_id: u32) -> anyhow::Result<Vec<u8>> {
 fn websocket_blob(json: serde_json::Value) -> LazyLoadBlob {
     LazyLoadBlob {
         mime: Some("application/json".to_string()),
-        bytes: json.to_string().into()
+        bytes: json.to_string().into_bytes()
     }
 }

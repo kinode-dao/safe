@@ -44,7 +44,7 @@ const WEBSOCKET_URL = import.meta.env.DEV
       let response = await fetch(`${BASE_URL}/safe`, {
         method: "POST",
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ safe: { address: safe }})
+        body: JSON.stringify({ AddSafe: safe })
       })
 
       if (response.status == 200) {
@@ -63,7 +63,7 @@ const WEBSOCKET_URL = import.meta.env.DEV
       await fetch(`${BASE_URL}/safe/peer`, {
         method: "POST",
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ peer, safe })
+        body: JSON.stringify({AddPeer:[safe, peer]})
       })
     }
   
@@ -86,39 +86,29 @@ const WEBSOCKET_URL = import.meta.env.DEV
           uri: WEBSOCKET_URL,
           nodeId: window.our.node,
           processId: window.our.process,
-          onOpen: (_event, _api) => {
-            console.log("Connected to uqbar node");
-            // api.send({ data: "Hello World" });
-          },
+          onOpen: (_event, _api) => { },
           onMessage: (json: string | Blob) => {
 
-            console.log("json", json);
-
-            if (typeof json === 'string') {
-            } else {
+            if (typeof json === 'string') { } 
+            else {
               const reader = new FileReader();
-    
               reader.onload = function(event) {
                 if (typeof event?.target?.result === 'string') {
                   try {
-                    console.log("parsing", event.target.result);
-                    const { safe } = JSON.parse(event.target.result);
+                    const payload = JSON.parse(event.target.result);
 
-                    if (safes.find(s => s.address == safe.address)) {
-                      console.log("Safe already exists", safe.address)
-                      return
-                    } 
-
-                    console.log("adding", safe);
-
-                    setSafes(prevSafes => prevSafes.concat(safe))
-    
+                    Object.keys(payload).forEach(key => {
+                      if (key == "AddSafe") {
+                        if (!safes.find(s => s.address == payload[key])) {
+                          setSafes(prevSafes => prevSafes.concat({address: payload[key]} as Safe))
+                        }
+                      }
+                    })
                   } catch (error) {
                     console.error("Error parsing WebSocket message", error);
                   }
                 }
               };
-    
               reader.readAsText(json);
             }
           },
