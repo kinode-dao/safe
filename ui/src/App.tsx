@@ -48,14 +48,7 @@ const WEBSOCKET_URL = import.meta.env.DEV
       })
 
       if (response.status == 200) {
-        setSafes(safes.concat({
-          address: safe,
-          peers: [],
-          signers: [],
-          delegates: [],
-          txs: [],
-          tx_sigs: [],
-        }))
+        setSafes(safes.concat({ address: safe, } as Safe))
       }
     }
   
@@ -67,16 +60,20 @@ const WEBSOCKET_URL = import.meta.env.DEV
       })
     }
   
+    // bootstrap
     useEffect(() => { (async() => {
-        let response = await fetch(`${BASE_URL}/safes`, { method: "GET" });
+
         let safes = []
-        let safes_response = await response.json()
-        console.log("safe responses", safes_response)
-        for (let key in safes_response) 
-          safes.push({ address: key, ...safes_response[key] })
-  
-        console.log("Safes", safes)
+        let safes_response = await (await fetch(`${BASE_URL}/safes`, { method: "GET" })).json();
+        let peers_response = await (await fetch(`${BASE_URL}/safes/peers`, { method: "GET" })).json();
+
+        for (let key in safes_response) {
+          let safe = { address: key, peers: peers_response[key], ...safes_response[key] }
+          safes.push(safe)
+        }
+
         setSafes(safes)
+
     })()}, []);
   
     useEffect(() => {
@@ -95,12 +92,32 @@ const WEBSOCKET_URL = import.meta.env.DEV
               reader.onload = function(event) {
                 if (typeof event?.target?.result === 'string') {
                   try {
-                    const payload = JSON.parse(event.target.result);
+                    const pkt = JSON.parse(event.target.result);
 
-                    Object.keys(payload).forEach(key => {
-                      if (key == "AddSafe") {
-                        if (!safes.find(s => s.address == payload[key])) {
-                          setSafes(prevSafes => prevSafes.concat({address: payload[key]} as Safe))
+                    Object.keys(pkt).forEach(key => {
+                      switch (key) {
+                        case "AddSafe": {
+                          if (!safes.find(s => s.address == pkt[key])) {
+                            setSafes(prevSafes => prevSafes
+                              .concat({address: pkt[key]} as Safe))
+                          }
+                          break;
+                        }
+                        case "AddPeer": {
+                          console.log("Add peer", pkt[key])
+                          let addr = pkt[key][0]
+                          let peer = pkt[key][1]
+                          let indx = safes.findIndex(s => s.address == addr)
+                          if (indx != -1) {
+                            if (!safes[indx].peers.find(p => p == peer)) {
+                              setSafes(prevSafes => prevSafes
+                                .map(s => s.address == addr ? {...s, peers: s.peers.concat(peer)} : s))
+                            }
+                          } else {
+                            setSafes(prevSafes => prevSafes
+                              .concat({address: pkt[key][0], peers: [pkt[key][1]]} as Safe))
+                          }
+                          break;
                         }
                       }
                     })
@@ -142,7 +159,6 @@ const WEBSOCKET_URL = import.meta.env.DEV
             <input type="text" onInput={e=>setNewSafe((e.target as HTMLInputElement).value)} value={newSafe} />
             <button onClick={e=>addSafe(newSafe)}> Add safe </button>
           </div>
-  
   
           <div style={{ display: "flex", flexDirection: "row", border: "1px solid gray", }} >
             <div style={{ flex: 1, borderRight: "1px solid gray", padding: "1em" }} >
