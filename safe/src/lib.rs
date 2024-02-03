@@ -461,21 +461,27 @@ fn handle_http_safe_peer(
     state: &mut State, 
     http_request: &http::IncomingHttpRequest
 ) -> anyhow::Result<()> { 
-    println!("safe peer {}", http_request.method()?.as_str());
+
+    println!("http safe peer {}", http_request.method()?.as_str());
+
     match http_request.method()?.as_str() {
         "POST" => {
+
+            println!("POST! {:?}", get_blob().unwrap().bytes);
 
             let (safe, peer) = match serde_json::from_slice::<SafeActions>(&get_blob().unwrap().bytes)? {
                 SafeActions::AddPeer(safe, peer) => (safe, peer),
                 _ => std::process::exit(1),
             };
 
+            println!("safe: {:?}, peer: {:?}", safe, peer);
+
             let _ = match state.safes.entry(safe) {
                 Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
                 Entry::Occupied(o) => {
 
-                    state.peers.safe_to_nodes.get_mut(&safe).unwrap().insert(peer.clone());
-                    state.peers.node_to_safes.get_mut(&peer).unwrap().insert(safe.clone());
+                    state.peers.safe_to_nodes.entry(safe.clone()).or_default().insert(peer.clone());
+                    state.peers.node_to_safes.entry(peer.clone()).or_default().insert(safe.clone());
 
                     Request::new()
                         .target(Address{node:peer, process:our.process.clone()})
