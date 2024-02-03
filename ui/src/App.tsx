@@ -68,7 +68,8 @@ const WEBSOCKET_URL = import.meta.env.DEV
         let peers_response = await (await fetch(`${BASE_URL}/safes/peers`, { method: "GET" })).json();
 
         for (let key in safes_response) {
-          let safe = { address: key, peers: peers_response[key], ...safes_response[key] }
+          let safe = { address: key, ...safes_response[key] }
+          if (peers_response[key]) safe.peers = peers_response[key]
           safes.push(safe)
         }
 
