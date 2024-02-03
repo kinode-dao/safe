@@ -154,6 +154,7 @@ Box::new(move |event: Vec<u8>, state: &mut State| {
     http::bind_http_path("/safe/send", true, false).unwrap();
     http::bind_http_path("/safe/signer", true, false).unwrap();
     http::bind_http_path("/safes", true, false).unwrap();
+    http::bind_http_path("/safes/peers", true, false).unwrap();
     http::bind_ws_path("/", true, false).unwrap();
 
     println!("Hello from Safe! {:?}", our);
@@ -337,6 +338,7 @@ fn handle_http_methods(
             "/" => handle_http_slash(our, state, http_request),
             "/safe" => handle_http_safe(our, state, provider, http_request),
             "/safes" => handle_http_safes(our, state, http_request),
+            "/safes/peers" => handle_http_safes_peers(our, state, http_request),
             "/safe/delegate" => handle_http_safe_delegate(our, state, http_request),
             "/safe/peer" => handle_http_safe_peer(our, state, http_request),
             "/safe/send" => handle_http_safe_send(our, state, http_request),
@@ -452,6 +454,21 @@ fn handle_http_safes(
     }
 }
 
+fn handle_http_safes_peers(
+    our: &Address, 
+    state: &mut State, 
+    http_request: &http::IncomingHttpRequest
+) -> anyhow::Result<()> { 
+
+    println!("handling http_safes_peers");
+    match http_request.method()?.as_str() {
+        "GET" => http::send_response
+            (http::StatusCode::OK, None, serde_json::to_vec(&state.peers.safe_to_nodes)?),
+        _ => http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![])
+    }
+
+}
+
 fn handle_http_safe_peer(
     our: &Address, 
     state: &mut State, 
@@ -476,8 +493,8 @@ fn handle_http_safe_peer(
                     state.peers.node_to_safes.entry(peer.clone()).or_default().insert(safe.clone());
 
                     Request::new()
-                        .target(Address{node:peer, process:our.process.clone()})
-                        .body(serde_json::to_vec(&SafeActions::AddSafe(safe))?)
+                        .target(Address{node:peer.clone(), process:our.process.clone()})
+                        .body(serde_json::to_vec(&SafeActions::AddPeer(safe, peer))?)
                         .send()?;
 
                     http::send_response(http::StatusCode::OK, None, vec![])
