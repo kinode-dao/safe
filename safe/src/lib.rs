@@ -245,13 +245,10 @@ fn handle_p2p_request(
     provider: &mut Provider<State>
 ) -> anyhow::Result<()> {
 
-    println!("handling p2p request");
+    println!("handling p2p request {:?}", msg.body());
 
-    match serde_json::from_slice::<SafeActions>(msg.body())? {
-        SafeActions::AddSafe(safe) => {
-
-            println!("add safe: {:?}", safe);
-
+    match serde_json::from_slice::<SafeActions>(msg.body()) {
+        Ok(SafeActions::AddSafe(safe))=> {
 
             match state.safes.entry(safe) {
                 Entry::Vacant(entry) => {
@@ -260,8 +257,8 @@ fn handle_p2p_request(
 
                     subscribe_to_safe(safe.clone(), state, provider)?;
 
-                    state.peers.safe_to_nodes.get_mut(&safe).unwrap().insert(msg.source().node.clone());
-                    state.peers.node_to_safes.get_mut(&msg.source().node.clone()).unwrap().insert(safe);
+                    state.peers.safe_to_nodes.entry(safe.clone()).or_default().insert(msg.source().node.clone());
+                    state.peers.node_to_safes.entry(msg.source().node.clone()).or_default().insert(safe);
 
                     Request::new()
                         .target((&our.node, "http_server", "distro", "sys"))
@@ -276,9 +273,8 @@ fn handle_p2p_request(
             }
 
         }
-        SafeActions::AddPeer(safe, peer) => {
-            println!("add peer: {:?} {:?}", safe, peer);
-        }
+        Err(e) => println!("Error: {:?}", e),
+        _ => std::process::exit(1),
     }
 
     Ok(())
