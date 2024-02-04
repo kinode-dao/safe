@@ -172,6 +172,7 @@ const WEBSOCKET_URL = import.meta.env.DEV
                     <input type="text" onInput={e=>setNewPeer((e.target as HTMLInputElement).value)} value={newPeer} />
                     <button onClick={e=>addPeer(safe.address, newPeer )}>Add Peer</button>
                   </div>
+                  { safe.peers }
                 </div>
               ) 
             } 
