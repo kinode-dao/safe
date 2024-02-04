@@ -494,7 +494,7 @@ fn handle_http_safe_peer(
 
                     Request::new()
                         .target(Address{node:peer.clone(), process:our.process.clone()})
-                        .body(serde_json::to_vec(&SafeActions::AddPeer(safe, peer))?)
+                        .body(serde_json::to_vec(&SafeActions::AddSafe(safe))?)
                         .send()?;
 
                     http::send_response(http::StatusCode::OK, None, vec![])
