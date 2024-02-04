@@ -258,13 +258,15 @@ fn handle_p2p_request(
 
                     subscribe_to_safe(safe.clone(), state, provider)?;
 
-                    state.peers.safe_to_nodes.entry(safe.clone()).or_default().insert(msg.source().node.clone());
-                    state.peers.node_to_safes.entry(msg.source().node.clone()).or_default().insert(safe);
+                    let peer = msg.source().node.clone();
+
+                    state.peers.safe_to_nodes.entry(safe.clone()).or_default().insert(peer.clone());
+                    state.peers.node_to_safes.entry(peer.clone()).or_default().insert(safe.clone());
 
                     Request::new()
                         .target((&our.node, "http_server", "distro", "sys"))
                         .body(websocket_body(state.ws_channel)?)
-                        .blob(websocket_blob(serde_json::json!(&SafeActions::AddSafe(safe))))
+                        .blob(websocket_blob(serde_json::json!(&SafeActions::AddPeer(safe, peer))))
                         .send()?;
 
                 }
