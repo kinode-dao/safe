@@ -5,12 +5,12 @@
         "on_exit": "Restart",
         "request_networking": true,
         "request_capabilities": [
-            "eth_provider:eth_provider:sys",
+            "eth:distro:sys",
             "http_server:distro:sys",
             "net:distro:sys"
         ],
         "grant_capabilities": [
-            "eth_provider:eth_provider:sys"
+            "eth:distro:sys"
         ],
         "public": true
     }
