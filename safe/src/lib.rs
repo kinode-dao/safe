@@ -1,25 +1,20 @@
+
+use alloy_primitives::{Address as EthAddress, Bytes, FixedBytes, U256};
+use alloy_rpc_types::{
+    pubsub::{Params, SubscriptionKind, SubscriptionResult},
+    BlockNumberOrTag, Filter, Log,
+};
 use alloy_sol_types::{sol, SolEvent, SolCall, SolValue, SolEnum};
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize, };
 use std::collections::HashSet;
 use std::collections::hash_map::{ Entry, HashMap, };
 use std::str::FromStr;
 use kinode_process_lib::{ 
+    eth::{get_block_number, get_logs, EthAction, EthResponse},
     await_message, get_blob, get_state, http, println, set_state,
     Address, Message, NodeId, LazyLoadBlob, Request, 
-};
-use kinode_process_lib::eth_alloy::{
-    U256,
-    Address as AlloyAddress,
-    BlockNumberOrTag,
-    Bytes,
-    CallInput,
-    CallRequest,
-    Log,
-    Filter,
-    Provider,
-    RpcResponse,
-    ValueOrArray,
 };
 
 wit_bindgen::generate!({
@@ -30,6 +25,8 @@ wit_bindgen::generate!({
     },
 });
 
+const SAFE_FACTORY_SUB_ID: u64 = 1;
+
 sol!(SafeL2, "./SafeL2.json");
 sol! {
     event ProxyCreation(address proxy, address singleton);
@@ -37,13 +34,13 @@ sol! {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 enum SafeActions {
-    AddSafe(AlloyAddress),
-    AddPeer(AlloyAddress, NodeId),
+    AddSafe(EthAddress),
+    AddPeer(EthAddress, NodeId),
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct SafeTx {
-    to: AlloyAddress,
+    to: EthAddress,
     value: u64,
     data: Vec<u8>,
     operation: u8,
@@ -57,8 +54,8 @@ struct SafeTx {
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 struct Safe {
-    address: AlloyAddress,
-    owners: HashSet<AlloyAddress>,
+    address: EthAddress,
+    owners: HashSet<EthAddress>,
     txs: HashMap<U256, SafeTx>,
     tx_sigs: HashMap<U256, Vec<Bytes>>,
     threshold: U256,
@@ -66,7 +63,7 @@ struct Safe {
 
 impl Safe {
 
-    fn new(address: AlloyAddress) -> Self {
+    fn new(address: EthAddress) -> Self {
         Safe {
             address,
             ..Default::default()
@@ -77,18 +74,19 @@ impl Safe {
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct Peers {
-    addr_to_nodes: HashMap<AlloyAddress, HashSet<NodeId>>,
-    node_to_addrs: HashMap<NodeId, HashSet<AlloyAddress>>,
-    safe_to_nodes: HashMap<AlloyAddress, HashSet<NodeId>>,
-    node_to_safes: HashMap<NodeId, HashSet<AlloyAddress>>,
+    addr_to_nodes: HashMap<EthAddress, HashSet<NodeId>>,
+    node_to_addrs: HashMap<NodeId, HashSet<EthAddress>>,
+    safe_to_nodes: HashMap<EthAddress, HashSet<NodeId>>,
+    node_to_safes: HashMap<NodeId, HashSet<EthAddress>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 struct State {
     peers: Peers,
-    safe_blocks: HashMap<AlloyAddress, u64>,
-    safes: HashMap<AlloyAddress, Safe>,
+    safe_blocks: HashMap<EthAddress, u64>,
+    safes: HashMap<EthAddress, Safe>,
     ws_channel: u32,
+    block: u64,
 }
 
 struct Component;
@@ -110,42 +108,60 @@ impl Guest for Component {
     }
 }
 
+fn handle_factory_log(our: &Address, state: &mut State, log: &Log) {
+
+    let decoded = 
+        ProxyCreation::abi_decode_data(&log.data, false).unwrap();
+
+    state.safe_blocks.insert(
+        decoded.0,
+        log.block_number.expect("REASON").to::<u64>(),
+    );
+
+}
+
+fn handle_safe_added_owner_log(our: &Address, state: &mut State, log: &Log) {
+
+    let safe = state.safes.get_mut(&log.address).unwrap();
+    safe.owners.insert(EthAddress::from_word(log.topics[1].into()));
+
+}
+
+fn handle_safe_removed_owner_log(our: &Address, state: &mut State, log: &Log) {
+
+    let safe = state.safes.get_mut(&log.address).unwrap();
+    safe.owners.remove(&EthAddress::from_word(log.topics[1].into()));
+
+}
+
 fn main(our: Address, mut state: State) -> Result<()> {
 
-    let mut provider = Provider::<State> { handlers: HashMap::new(), count: 0 };
+    let mut sub_handlers: HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>> = HashMap::new();
 
-    let sub_filter = Filter::new()
-        .address(AlloyAddress::from_str("0xc22834581ebc8527d974f8a1c97e1bea4ef910bc")?)
+    let safe_factory_filter = Filter::new()
+        .address(EthAddress::from_str("0xc22834581ebc8527d974f8a1c97e1bea4ef910bc")?)
         .from_block(2087031)
         .events(vec!["ProxyCreation(address,address)"]);
 
-    provider.subscribe_logs(
-        sub_filter,
-Box::new(move |event: Vec<u8>, state: &mut State| {
+    if state.block < get_block_number()? {
+        let logs = get_logs(safe_factory_filter.clone())?;
+        for log in logs {
+            handle_factory_log(&our, &mut state, &log);
+        }
+    }
 
-            let logs: Vec<Log> = match serde_json::from_slice::<ValueOrArray<Log>>(&event) {
-                Ok(log) => match log {
-                    ValueOrArray::Value(log) => vec![log],
-                    ValueOrArray::Array(logs) => logs,
-                },
-                Err(e) => {
-                    println!("Error: {:?}, {:?}", &event, e);
-                    return;
-                }
-            };
+    let params = Params::Logs(Box::new(safe_factory_filter));
+    let kind = SubscriptionKind::Logs;
 
-            for log in logs {
-                let decoded = 
-                    ProxyCreation::abi_decode_data(&log.data, false).unwrap();
-
-                state.safe_blocks.insert(
-                    decoded.0,
-                    log.block_number.expect("REASON").to::<u64>(),
-                );
-            }
-
-        }),
-    );
+    sub_handlers.insert(sub_handlers.len().try_into().unwrap(), Box::new(handle_factory_log));
+    Request::new()
+        .target((&our.node, "eth", "distro", "sys"))
+        .body(serde_json::to_vec(&EthAction::SubscribeLogs {
+            sub_id: SAFE_FACTORY_SUB_ID,
+            kind,
+            params,
+        })?)
+        .send()?;
 
     http::bind_http_path("/", true, false).unwrap();
     http::bind_http_path("/safe", true, false).unwrap();
@@ -162,9 +178,8 @@ Box::new(move |event: Vec<u8>, state: &mut State| {
     loop {
         match await_message() {
             Ok(msg) => {
-
                 match msg.is_request() {
-                    true => handle_request(&our, &msg, &mut state, &mut provider)?,
+                    true => handle_request(&our, &msg, &mut state, &mut sub_handlers)?,
                     false => handle_response(&our, &msg, &mut state)?
                 }
                 let _ = set_state(&bincode::serialize(&state).unwrap());
@@ -187,7 +202,7 @@ fn handle_request(
     our: &Address, 
     msg: &Message, 
     state: &mut State, 
-    provider: &mut Provider<State>
+    sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>> 
 ) -> anyhow::Result<()> {
 
     if !msg.is_request() {
@@ -195,7 +210,7 @@ fn handle_request(
     }
 
     if  msg.source().node != our.node {
-            let _ = handle_p2p_request(our, msg, state, provider);
+            let _ = handle_p2p_request(our, msg, state, sub_handlers);
     } else if
         msg.source().node == our.node && 
         msg.source().process == "terminal:distro:sys" {
@@ -203,11 +218,11 @@ fn handle_request(
     } else if 
         msg.source().node == our.node &&
         msg.source().process == "http_server:distro:sys" {
-            let _ = handle_http_request(our, msg, state, provider);
+            let _ = handle_http_request(our, msg, state, sub_handlers);
     } else if
         msg.source().node == our.node &&
-        msg.source().process == "eth_provider:eth_provider:sys" {
-            let _ = handle_eth_request(our, msg, state, provider);
+        msg.source().process == "eth:distro:sys" {
+            let _ = handle_eth_request(our, msg, state, sub_handlers);
     }
 
     Ok(())
@@ -218,21 +233,19 @@ fn handle_eth_request(
     our: &Address, 
     msg: &Message, 
     state: &mut State, 
-    provider: &mut Provider<State>
+    sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>> 
 ) -> anyhow::Result<()> {
 
-    if let Ok(rpc_response) = serde_json::from_slice::<RpcResponse>(&msg.body()) {
+    let Ok(res) = serde_json::from_slice::<EthResponse>(msg.body()) else {
+        return Err(anyhow::anyhow!("safe: got invalid message"));
+    };
 
-        provider.receive(
-            msg.metadata().unwrap().parse::<u64>().unwrap(),
-            serde_json::to_vec(&rpc_response.result).unwrap(), 
-            state
-        );
-        
-    } else {
-
-        println!("safe: got invalid message");
-
+    match res {
+        EthResponse::Sub { id, result } => match result {
+            SubscriptionResult::Log(log) => sub_handlers.get_mut(&id).unwrap()(our, state, &log),
+            _ => {}
+        },
+        _ => {}
     };
 
     Ok(())
@@ -243,7 +256,7 @@ fn handle_p2p_request(
     our: &Address, 
     msg: &Message, 
     state: &mut State,
-    provider: &mut Provider<State>
+    sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>
 ) -> anyhow::Result<()> {
 
     println!("handling p2p request {:?}", msg.body());
@@ -256,7 +269,7 @@ fn handle_p2p_request(
 
                     entry.insert(Safe::new(safe.clone()));
 
-                    subscribe_to_safe(safe.clone(), state, provider)?;
+                    subscribe_to_safe(&our, safe.clone(), state, sub_handlers)?;
 
                     let peer = msg.source().node.clone();
 
@@ -292,21 +305,22 @@ fn handle_http_request(
     our: &Address, 
     msg: &Message, 
     state: &mut State, 
-    provider: &mut Provider<State>
+    sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>,
 ) -> anyhow::Result<()> {
 
     println!("handling http request");
 
     match serde_json::from_slice::<http::HttpServerRequest>(msg.body())? {
         http::HttpServerRequest::Http(ref incoming) => {
-            match handle_http_methods(our, state, provider, incoming) {
+            match handle_http_methods(our, state, sub_handlers, incoming) {
                 Ok(()) => Ok(()),
-                Err(_) => {
+                Err(e) => {
                     http::send_response(
                         http::StatusCode::SERVICE_UNAVAILABLE,
                         None,
                         "Service Unavailable".to_string().as_bytes().to_vec(),
-                    )
+                    );
+                    return Ok(());
                 }
             }
         }
@@ -330,7 +344,7 @@ fn handle_http_request(
 fn handle_http_methods(
     our: &Address, 
     state: &mut State, 
-    provider: &mut Provider<State>,
+    sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>,
     http_request: &http::IncomingHttpRequest,
 ) -> anyhow::Result<()> {
 
@@ -338,18 +352,19 @@ fn handle_http_methods(
         println!("http path: {:?}, method: {:?}", path, http_request.method());
         match &path[..] {
             "/" => handle_http_slash(our, state, http_request),
-            "/safe" => handle_http_safe(our, state, provider, http_request),
+            "/safe" => handle_http_safe(our, state, sub_handlers, http_request),
             "/safes" => handle_http_safes(our, state, http_request),
             "/safes/peers" => handle_http_safes_peers(our, state, http_request),
             "/safe/delegate" => handle_http_safe_delegate(our, state, http_request),
             "/safe/peer" => handle_http_safe_peer(our, state, http_request),
             "/safe/send" => handle_http_safe_send(our, state, http_request),
             "/safe/signer" => handle_http_safe_signer(our, state, http_request),
-            &_ => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![])
-        }
-    } else {
-        Ok(())
-    }
+            &_ => Ok(http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]))
+        };
+    } 
+
+    Ok(())
+
 
 }
 
@@ -389,8 +404,8 @@ fn handle_http_slash(
 fn handle_http_safe(
     our: &Address, 
     state: &mut State, 
-    provider: &mut Provider<State>,
-    http_request: &http::IncomingHttpRequest
+    sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>,
+    http_request: &http::IncomingHttpRequest,
 ) -> anyhow::Result<()> { 
 
     println!("handling http_safe");
@@ -404,7 +419,8 @@ fn handle_http_safe(
         "POST" => {
 
             let Some(blob) = get_blob() else {
-                return http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+                http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+                return Ok(());
             };
 
             let safe = match serde_json::from_slice::<SafeActions>(&blob.bytes) {
@@ -416,7 +432,7 @@ fn handle_http_safe(
             match state.safes.entry(safe) {
                 Entry::Vacant(v) => {
                     v.insert(Safe::new(safe));
-                    subscribe_to_safe(safe, state, provider)?;
+                    subscribe_to_safe(our, safe, state, sub_handlers)?;
                     let _ = http::send_response(http::StatusCode::OK, None, vec![]);
                 }
                 Entry::Occupied(_) => {
@@ -454,6 +470,8 @@ fn handle_http_safes(
         "GET" => http::send_response(http::StatusCode::OK, None, serde_json::to_vec(&state.safes)?),
         _ => http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![])
     }
+
+    Ok(())
 }
 
 fn handle_http_safes_peers(
@@ -468,6 +486,8 @@ fn handle_http_safes_peers(
             (http::StatusCode::OK, None, serde_json::to_vec(&state.peers.safe_to_nodes)?),
         _ => http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![])
     }
+
+    Ok(())
 
 }
 
@@ -512,109 +532,111 @@ fn handle_http_safe_peer(
 }
 
 fn handle_http_safe_delegate(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
-fn handle_http_safe_send(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
+
+fn handle_http_safe_send(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { 
+
+    println!("http_safe_send");
+    Ok(())
+
+
+    // let send_call = SafeL2::execTransactionCall::new(
+    //     (
+    //         EthAddress::from_str("0xDe12193c037F768fDC0Db0B77B7E70de723b95E7")?,
+    //         U256::from(1),
+    //         Bytes::from(vec![0x00]),
+    //         0,
+    //         0,
+    //         0,
+    //         0,
+    //         0,
+    //         0,
+    //     )
+    // );
+
+
+}
+
 fn handle_http_safe_signer(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
 
-fn subscribe_to_safe(safe: AlloyAddress, state: &mut State, provider: &mut Provider<State>) -> anyhow::Result<()> {
+fn subscribe_to_safe(
+    our: &Address, 
+    safe: EthAddress, 
+    state: &mut State,
+    sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>
+) -> anyhow::Result<()> {
 
-    let mut owners_call_request = CallRequest::default();
-    owners_call_request.to = Some(safe);
-    owners_call_request.input = CallInput::new(SafeL2::getOwnersCall::new(()).abi_encode().into());
+    // let mut owners_call_requesft = CallRequest::default();
+    // owners_call_request.to = Some(safe);
+    // owners_call_request.input = CallInput::new(SafeL2::getOwnersCall::new(()).abi_encode().into());
 
-    provider.call(
-        owners_call_request,
-        Box::new(move |call: Vec<u8>, state: &mut State| {
+    // provider.call(
+    //     owners_call_request,
+    //     Box::new(move |call: Vec<u8>, state: &mut State| {
 
-            let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
-            let decoded  = match SafeL2::getOwnersCall::abi_decode_returns(bytes, false) {
-                Ok(decoded) => decoded,
-                Err(_) => return
-            };
+    //         let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
+    //         let decoded  = match SafeL2::getOwnersCall::abi_decode_returns(bytes, false) {
+    //             Ok(decoded) => decoded,
+    //             Err(_) => return
+    //         };
 
-            let safe = state.safes.get_mut(&safe.clone()).unwrap();
+    //         let safe = state.safes.get_mut(&safe.clone()).unwrap();
 
-            for owner in decoded._0 {
-                safe.owners.insert(owner);
-            }
+    //         for owner in decoded._0 {
+    //             safe.owners.insert(owner);
+    //         }
 
-        })
-    );
+    //     })
+    // );
 
-    let mut get_threshold_request = CallRequest::default();
-    get_threshold_request.to = Some(safe);
-    get_threshold_request.input = CallInput::new(SafeL2::getThresholdCall::new(()).abi_encode().into());
+    // let mut get_threshold_request = CallRequest::default();
+    // get_threshold_request.to = Some(safe);
+    // get_threshold_request.input = CallInput::new(SafeL2::getThresholdCall::new(()).abi_encode().into());
 
-    provider.call(
-        get_threshold_request,
-        Box::new(move |call: Vec<u8>, state: &mut State| {
+    // provider.call(
+    //     get_threshold_request,
+    //     Box::new(move |call: Vec<u8>, state: &mut State| {
 
-            let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
-            let decoded  = match SafeL2::getThresholdCall::abi_decode_returns(bytes, false) {
-                Ok(decoded) => decoded,
-                Err(_) => return
-            };
+    //         let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
+    //         let decoded  = match SafeL2::getThresholdCall::abi_decode_returns(bytes, false) {
+    //             Ok(decoded) => decoded,
+    //             Err(_) => return
+    //         };
 
-            let safe = state.safes.get_mut(&safe.clone()).unwrap();
-            safe.threshold = decoded._0;
+    //         let safe = state.safes.get_mut(&safe.clone()).unwrap();
+    //         safe.threshold = decoded._0;
 
-        })
-    );
+    //     })
+    // );
 
     let added_owner_filter = Filter::new()
         .address(safe.clone())
         .from_block(BlockNumberOrTag::Latest)
         .events(vec![SafeL2::AddedOwner::SIGNATURE]);
 
-    provider.subscribe_logs(
-        added_owner_filter,
-        Box::new(move |event: Vec<u8>, state: &mut State| {
-
-            let logs: Vec<Log> = match serde_json::from_slice::<ValueOrArray<Log>>(&event) {
-                Ok(log) => match log {
-                    ValueOrArray::Value(log) => vec![log],
-                    ValueOrArray::Array(logs) => logs,
-                },
-                Err(e) => {
-                    println!("Error: {:?}, {:?}", &event, e);
-                    return;
-                }
-            };
-
-            for log in logs {
-                let safe = state.safes.get_mut(&log.address).unwrap();
-                safe.owners.insert(AlloyAddress::from_word(log.topics[1].into()));
-            }
-
-        }),
-    );
+    sub_handlers.insert(sub_handlers.len().try_into().unwrap(), Box::new(handle_safe_added_owner_log));
+    Request::new()
+        .target((&our.node, "eth", "distro", "sys"))
+        .body(serde_json::to_vec(&EthAction::SubscribeLogs {
+            sub_id: sub_handlers.len().try_into().unwrap(),
+            kind: SubscriptionKind::Logs,
+            params: Params::Logs(Box::new(added_owner_filter)),
+        })?)
+        .send()?;
 
     let removed_owner_filter = Filter::new()
         .address(safe.clone())
         .from_block(BlockNumberOrTag::Latest)
         .events(vec![SafeL2::RemovedOwner::SIGNATURE]);
 
-    provider.subscribe_logs(
-        removed_owner_filter,
-        Box::new(move |event: Vec<u8>, state: &mut State| {
-
-            let logs: Vec<Log> = match serde_json::from_slice::<ValueOrArray<Log>>(&event) {
-                Ok(log) => match log {
-                    ValueOrArray::Value(log) => vec![log],
-                    ValueOrArray::Array(logs) => logs,
-                },
-                Err(e) => {
-                    println!("Error: {:?}, {:?}", &event, e);
-                    return;
-                }
-            };
-
-            for log in logs {
-                let safe = state.safes.get_mut(&log.address).unwrap();
-                safe.owners.remove(&AlloyAddress::from_word(log.topics[1].into()));
-            }
-
-        }),
-    );
+    sub_handlers.insert(sub_handlers.len().try_into().unwrap(), Box::new(handle_safe_removed_owner_log));
+    Request::new()
+        .target((&our.node, "eth", "distro", "sys"))
+        .body(serde_json::to_vec(&EthAction::SubscribeLogs {
+            sub_id: sub_handlers.len().try_into().unwrap(),
+            kind: SubscriptionKind::Logs,
+            params: Params::Logs(Box::new(removed_owner_filter)),
+        })?)
+        .send()?;
 
     Ok(())
 
