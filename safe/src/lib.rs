@@ -1,9 +1,10 @@
-
+use alloy_consensus::TxKind;
 use alloy_primitives::{Address as EthAddress, Bytes, FixedBytes, U256};
 use alloy_rpc_types::{
     pubsub::{Params, SubscriptionKind, SubscriptionResult},
     BlockNumberOrTag, CallInput, CallRequest, Filter, Log,
 };
+use alloy_signer::{k256::ecdsa::SigningKey, LocalWallet, Signer, SignerSync, Transaction, Wallet};
 use alloy_sol_types::{sol, SolEvent, SolCall, SolValue, SolEnum};
 
 use anyhow::Result;
@@ -16,6 +17,9 @@ use kinode_process_lib::{
     await_message, get_blob, get_state, http, println, set_state,
     Address, Message, NodeId, LazyLoadBlob, Request, 
 };
+
+mod helpers;
+use crate::helpers::encryption::{decrypt_data, encrypt_data};
 
 wit_bindgen::generate!({
     path: "wit",
@@ -35,7 +39,7 @@ sol! {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 enum SafeActions {
     AddSafe(EthAddress),
-    AddPeer(EthAddress, NodeId),
+    AddPeers(EthAddress, Vec<NodeId>),
     AddOwners(EthAddress, Vec<EthAddress>),
     UpdateThreshold(EthAddress, u64),
 }
@@ -89,6 +93,7 @@ struct State {
     safes: HashMap<EthAddress, Safe>,
     ws_channel: u32,
     block: u64,
+    wallet: Option<Vec<u8>>,
 }
 
 struct Component;
@@ -97,10 +102,68 @@ impl Guest for Component {
 
         let our = Address::from_str(&our).unwrap();
 
-        let state = match get_state() {
+        let mut state = match get_state() {
             Some(state) => bincode::deserialize::<State>(&state).unwrap(),
             None => State::default()
         };
+
+        // this block is essentially a messy CLI initialization app,
+        // todo fix it up.
+        // also todo, save pk in file, store bookmarks etc in state.
+        let mut wallet = loop {
+
+            match &state.wallet {
+                Some(encrypted_wallet) => {
+
+                    println!("Enter password to unlock wallet:");
+                    let password_msg = await_message().unwrap();
+                    let password_str = String::from_utf8
+                        (password_msg.body().to_vec()).unwrap_or_else(|_| "".to_string());
+
+                    match decrypt_data(&encrypted_wallet, &password_str) {
+                        Ok(decrypted_wallet) => match String::from_utf8(decrypted_wallet)
+                            .ok()
+                            .and_then(|wd| wd.parse::<LocalWallet>().ok())
+                        {
+                            Some(live_wallet) => {
+                                println!(
+                                    "Trader: Loaded wallet with address: {:?}",
+                                    live_wallet.address()
+                                );
+                                break Some(live_wallet)
+                            }
+                            None => println!("Failed to parse wallet, try again."),
+                        },
+                        Err(_) => println!("Decryption failed, try again."),
+                    }
+                }
+                None => {
+                    println!("No wallet loaded, input a key:");
+                    let wallet_msg = await_message().unwrap();
+                    let wallet_data_str = String::from_utf8(wallet_msg.body().to_vec()).unwrap();
+
+                    println!("Input a password to save it:");
+                    let password_msg = await_message().unwrap();
+                    let password_str = String::from_utf8(password_msg.body().to_vec()).unwrap();
+
+                    let encrypted_wallet_data = encrypt_data(wallet_data_str.as_bytes(), &password_str);
+                    state.wallet = Some(encrypted_wallet_data.clone());
+
+                    if let Ok(live_wallet) = wallet_data_str.parse::<LocalWallet>() {
+                        println!(
+                            "Trader: Loaded wallet with address: {:?}",
+                            live_wallet.address()
+                        );
+                        break Some(live_wallet)
+                    } else {
+                        println!("Failed to parse wallet key, try again.");
+                    }
+                }
+            }
+        }
+        .expect("Failed to initialize wallet");
+
+        println!("wallet {:?}", wallet);
 
         match main(our, state) {
             Ok(_) => {}
@@ -281,7 +344,7 @@ fn handle_p2p_request(
                     Request::new()
                         .target((&our.node, "http_server", "distro", "sys"))
                         .body(websocket_body(state.ws_channel)?)
-                        .blob(websocket_blob(serde_json::json!(&SafeActions::AddPeer(safe, peer))))
+                        .blob(websocket_blob(serde_json::json!(&SafeActions::AddPeers(safe, vec![peer]))))
                         .send()?;
 
                 }
@@ -506,8 +569,8 @@ fn handle_http_safe_peer(
     match http_request.method()?.as_str() {
         "POST" => {
 
-            let (safe, peer) = match serde_json::from_slice::<SafeActions>(&get_blob().unwrap().bytes)? {
-                SafeActions::AddPeer(safe, peer) => (safe, peer),
+            let (safe, peers) = match serde_json::from_slice::<SafeActions>(&get_blob().unwrap().bytes)? {
+                SafeActions::AddPeers(safe, peers) => (safe, peers),
                 _ => std::process::exit(1),
             };
 
@@ -515,13 +578,16 @@ fn handle_http_safe_peer(
                 Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
                 Entry::Occupied(o) => {
 
-                    state.peers.safe_to_nodes.entry(safe.clone()).or_default().insert(peer.clone());
-                    state.peers.node_to_safes.entry(peer.clone()).or_default().insert(safe.clone());
+                    for peer in peers {
 
-                    Request::new()
-                        .target(Address{node:peer.clone(), process:our.process.clone()})
-                        .body(serde_json::to_vec(&SafeActions::AddSafe(safe))?)
-                        .send()?;
+                        state.peers.safe_to_nodes.entry(safe.clone()).or_default().insert(peer.clone());
+                        state.peers.node_to_safes.entry(peer.clone()).or_default().insert(safe.clone());
+
+                        Request::new()
+                            .target(Address{node:peer.clone(), process:our.process.clone()})
+                            .body(serde_json::to_vec(&SafeActions::AddSafe(safe))?)
+                            .send()?;
+                    }
 
                     http::send_response(http::StatusCode::OK, None, vec![])
 
@@ -598,7 +664,7 @@ fn subscribe_to_safe(
     Request::new()
         .target((&our.node, "http_server", "distro", "sys"))
         .body(websocket_body(state.ws_channel)?)
-        .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateThreshold(safe, state_safe.threshold.clone()))))
+        .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateThreshold(safe, state_safe.threshold.clone().to::<u64>()))))
         .send()?;
 
     let added_owner_filter = Filter::new()
