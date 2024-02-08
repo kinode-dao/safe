@@ -2,7 +2,7 @@
 use alloy_primitives::{Address as EthAddress, Bytes, FixedBytes, U256};
 use alloy_rpc_types::{
     pubsub::{Params, SubscriptionKind, SubscriptionResult},
-    BlockNumberOrTag, Filter, Log,
+    BlockNumberOrTag, CallInput, CallRequest, Filter, Log,
 };
 use alloy_sol_types::{sol, SolEvent, SolCall, SolValue, SolEnum};
 
@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::collections::hash_map::{ Entry, HashMap, };
 use std::str::FromStr;
 use kinode_process_lib::{ 
-    eth::{get_block_number, get_logs, EthAction, EthResponse},
+    eth::{call, get_block_number, get_logs, EthAction, EthResponse},
     await_message, get_blob, get_state, http, println, set_state,
     Address, Message, NodeId, LazyLoadBlob, Request, 
 };
@@ -36,6 +36,8 @@ sol! {
 enum SafeActions {
     AddSafe(EthAddress),
     AddPeer(EthAddress, NodeId),
+    AddOwners(EthAddress, Vec<EthAddress>),
+    UpdateThreshold(EthAddress, u64),
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -350,7 +352,7 @@ fn handle_http_methods(
 
     if let Ok(path) = http_request.path() {
         println!("http path: {:?}, method: {:?}", path, http_request.method());
-        match &path[..] {
+        let _ = match &path[..] {
             "/" => handle_http_slash(our, state, http_request),
             "/safe" => handle_http_safe(our, state, sub_handlers, http_request),
             "/safes" => handle_http_safes(our, state, http_request),
@@ -431,9 +433,11 @@ fn handle_http_safe(
 
             match state.safes.entry(safe) {
                 Entry::Vacant(v) => {
+
                     v.insert(Safe::new(safe));
                     subscribe_to_safe(our, safe, state, sub_handlers)?;
                     let _ = http::send_response(http::StatusCode::OK, None, vec![]);
+
                 }
                 Entry::Occupied(_) => {
                     let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
@@ -565,48 +569,37 @@ fn subscribe_to_safe(
     sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>
 ) -> anyhow::Result<()> {
 
-    // let mut owners_call_requesft = CallRequest::default();
-    // owners_call_request.to = Some(safe);
-    // owners_call_request.input = CallInput::new(SafeL2::getOwnersCall::new(()).abi_encode().into());
+    let state_safe = state.safes.get_mut(&safe.clone()).unwrap();
 
-    // provider.call(
-    //     owners_call_request,
-    //     Box::new(move |call: Vec<u8>, state: &mut State| {
+    let mut owners_call_request = CallRequest::default();
+    owners_call_request.input = CallInput::new(SafeL2::getOwnersCall::new(()).abi_encode().into());
+    owners_call_request.to = Some(safe);
 
-    //         let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
-    //         let decoded  = match SafeL2::getOwnersCall::abi_decode_returns(bytes, false) {
-    //             Ok(decoded) => decoded,
-    //             Err(_) => return
-    //         };
+    let owners_result = call(owners_call_request, None)?;
+    let owners = SafeL2::getOwnersCall::abi_decode_returns(&owners_result, false)?;
 
-    //         let safe = state.safes.get_mut(&safe.clone()).unwrap();
+    for owner in owners._0 { state_safe.owners.insert(owner); }
 
-    //         for owner in decoded._0 {
-    //             safe.owners.insert(owner);
-    //         }
+    let mut get_threshold_request = CallRequest::default();
+    get_threshold_request.input = CallInput::new(SafeL2::getThresholdCall::new(()).abi_encode().into());
+    get_threshold_request.to = Some(safe);
 
-    //     })
-    // );
+    let threshold_result = call(get_threshold_request, None)?;
+    let threshold = SafeL2::getThresholdCall::abi_decode_returns(&threshold_result, false)?;
 
-    // let mut get_threshold_request = CallRequest::default();
-    // get_threshold_request.to = Some(safe);
-    // get_threshold_request.input = CallInput::new(SafeL2::getThresholdCall::new(()).abi_encode().into());
+    state_safe.threshold = threshold._0;
 
-    // provider.call(
-    //     get_threshold_request,
-    //     Box::new(move |call: Vec<u8>, state: &mut State| {
+    Request::new()
+        .target((&our.node, "http_server", "distro", "sys"))
+        .body(websocket_body(state.ws_channel)?)
+        .blob(websocket_blob(serde_json::json!(&SafeActions::AddOwners(safe, state_safe.owners.clone().into_iter().collect()))))
+        .send()?;
 
-    //         let bytes = &serde_json::from_slice::<Bytes>(call.as_slice()).unwrap();
-    //         let decoded  = match SafeL2::getThresholdCall::abi_decode_returns(bytes, false) {
-    //             Ok(decoded) => decoded,
-    //             Err(_) => return
-    //         };
-
-    //         let safe = state.safes.get_mut(&safe.clone()).unwrap();
-    //         safe.threshold = decoded._0;
-
-    //     })
-    // );
+    Request::new()
+        .target((&our.node, "http_server", "distro", "sys"))
+        .body(websocket_body(state.ws_channel)?)
+        .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateThreshold(safe, state_safe.threshold.clone()))))
+        .send()?;
 
     let added_owner_filter = Filter::new()
         .address(safe.clone())
