@@ -6,6 +6,7 @@ import viteLogo from "./assets/vite.svg";
 import NectarEncryptorApi from "@uqbar/client-encryptor-api";
 import ConnectWallet from "./components/ConnectWallet";
 import Header from "./components/Header";
+import _ from "lodash";
 import "./App.css";
 
 const { useIsActivating, useChainId } = hooks;
@@ -41,10 +42,11 @@ function App() {
   type Safe = {
     address: string,
     peers: string[],
-    signers: string[],
+    owners: string[],
     delegates: string[],
     txs: string[],
     tx_sigs: string[],
+    threshold: number
   };
 
   const [safes, setSafes] = useState<Safe[]>([]);
@@ -142,6 +144,33 @@ function App() {
                             .concat({address: pkt[key][0], peers: [pkt[key][1]]} as Safe))
                         }
                         break;
+                      }
+                      case "AddOwners": {
+                        let safe = pkt[key][0]
+                        let owners = pkt[key][1]
+                        console.log("add owners", safe, owners)
+                        let indx = safes.findIndex(s => s.address == safe.address)
+                        if (indx != -1 && !_.isEqual(safes[indx].owners, owners)) {
+                          setSafes(prevSafes => prevSafes.map((s,ix) => { 
+                              if (ix == indx) { 
+                                for (let owner of owners) {
+                                  if (!s.owners.find(o => o == owner)) {
+                                    s.owners.push(owner)
+                                  }
+                                }
+                              } 
+                              return s 
+                          }))
+                        }
+                        break;
+                      }
+                      case "UpdateThreshold": {
+                        let safe = pkt[key][0]
+                        let threshold = pkt[key][1]
+                        console.log("update threshold", safe, threshold)
+                        let indx = safes.findIndex(s => s.address == safe.address)
+                        setSafes(prevSafes => prevSafes
+                          .map((s,ix) => ix == indx ? {...s, threshold: threshold} : s))
                       }
                     }
                   })
