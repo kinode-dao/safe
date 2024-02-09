@@ -1,5 +1,5 @@
 use alloy_consensus::TxKind;
-use alloy_primitives::{Address as EthAddress, Bytes, FixedBytes, U256};
+use alloy_primitives::{Address as EthAddress, Bytes, FixedBytes, U8, U256};
 use alloy_rpc_types::{
     pubsub::{Params, SubscriptionKind, SubscriptionResult},
     BlockNumberOrTag, CallInput, CallRequest, Filter, Log,
@@ -11,9 +11,14 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize, };
 use std::collections::HashSet;
 use std::collections::hash_map::{ Entry, HashMap, };
+use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 use kinode_process_lib::{ 
-    eth::{call, get_block_number, get_logs, EthAction, EthResponse},
+    eth::{
+        call, estimate_gas, get_block_number, get_gas_price, get_logs, 
+        EthAction, EthResponse
+    },
     await_message, get_blob, get_state, http, println, set_state,
     Address, Message, NodeId, LazyLoadBlob, Request, 
 };
@@ -41,29 +46,33 @@ enum SafeActions {
     AddSafe(EthAddress),
     AddPeers(EthAddress, Vec<NodeId>),
     AddOwners(EthAddress, Vec<EthAddress>),
+    AddTxFrontend(EthAddress, EthAddress, u64),
+    AddTx(SafeTx),
     UpdateThreshold(EthAddress, u64),
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct SafeTx {
     to: EthAddress,
-    value: u64,
-    data: Vec<u8>,
-    operation: u8,
-    safe_tx_gas: u64,
-    base_gas: u64,
-    gas_price: u64,
-    gas_token: Address,
-    refund_receiver: Address,
-    nonce: u64,
+    value: U256,
+    data: Bytes,
+    operation: U8,
+    safe_tx_gas: U256,
+    base_gas: U256,
+    gas_price: U256,
+    gas_token: EthAddress,
+    refund_receiver: EthAddress,
+    nonce: U256,
+    originator: Address,
+    timestamp: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 struct Safe {
     address: EthAddress,
     owners: HashSet<EthAddress>,
-    txs: HashMap<U256, SafeTx>,
-    tx_sigs: HashMap<U256, Vec<Bytes>>,
+    txs: BTreeMap<U256, Vec<SafeTx>>,
+    tx_sigs: BTreeMap<U256, Vec<Bytes>>,
     threshold: U256,
 }
 
@@ -422,7 +431,7 @@ fn handle_http_methods(
             "/safes/peers" => handle_http_safes_peers(our, state, http_request),
             "/safe/delegate" => handle_http_safe_delegate(our, state, http_request),
             "/safe/peer" => handle_http_safe_peer(our, state, http_request),
-            "/safe/send" => handle_http_safe_send(our, state, http_request),
+            "/safe/send" => handle_http_safe_tx(our, state, http_request),
             "/safe/signer" => handle_http_safe_signer(our, state, http_request),
             &_ => Ok(http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]))
         };
@@ -603,30 +612,123 @@ fn handle_http_safe_peer(
 
 fn handle_http_safe_delegate(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
 
-fn handle_http_safe_send(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { 
+fn handle_http_safe_tx(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { 
+
+    match http_request.method()?.as_str() {
+        "POST" => {
+
+            let (safe, to, value) = match serde_json::from_slice::<SafeActions>(&get_blob().unwrap().bytes)? {
+                SafeActions::AddTxFrontend(safe, to, value) => (safe, to, value),
+                _ => std::process::exit(1),
+            };
+
+            let _ = match state.safes.entry(safe) {
+                Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
+                Entry::Occupied(mut o) => {
+
+                    let estimate = estimate_gas(
+                        CallRequest {
+                            from: Some(safe),
+                            to: Some(to),
+                            value: Some(U256::from(value)),
+                            input: CallInput::new(Bytes::default()),
+                            ..Default::default()
+                        },
+                        None
+                    ).unwrap();
+
+                    let nonce = get_nonce(safe).unwrap();
+
+                    let tx = SafeTx {
+                        to: to,
+                        value: U256::from(value),
+                        data: Bytes::default(),
+                        operation: U8::from(0),
+                        safe_tx_gas: U256::from(10000),
+                        base_gas: estimate,
+                        gas_price: get_gas_price().unwrap(),
+                        gas_token: EthAddress::default(),
+                        refund_receiver: safe,
+                        nonce: nonce.clone(),
+                        originator: our.clone(),
+                        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                    };
+
+                    let nonce_txs = o.get_mut().txs.get_mut(&nonce).unwrap();
+                    nonce_txs.push(tx.clone());
+
+                    let peers = state.peers.safe_to_nodes.get(&safe).unwrap();
+
+                    for peer in peers {
+
+                        let _ = Request::new()
+                            .target(Address{node:peer.clone(), process:our.process.clone()})
+                            .body(serde_json::to_vec(&SafeActions::AddTx(tx.clone()))?)
+                            .send()?;
+
+                    }
+
+                    http::send_response(http::StatusCode::OK, None, vec![])
+
+                }
+            };
+        }
+        _ => {
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]); 
+        }
+
+    }
 
     println!("http_safe_send");
     Ok(())
 
+}
 
-    // let send_call = SafeL2::execTransactionCall::new(
-    //     (
-    //         EthAddress::from_str("0xDe12193c037F768fDC0Db0B77B7E70de723b95E7")?,
-    //         U256::from(1),
-    //         Bytes::from(vec![0x00]),
-    //         0,
-    //         0,
-    //         0,
-    //         0,
-    //         0,
-    //         0,
-    //     )
-    // );
+fn handle_http_safe_tx_sign(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { 
 
+    match http_request.method()?.as_str() {
+        "POST" => {
+
+        }
+        _ => { 
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]); 
+        }
+
+    }
+
+    Ok(()) 
+}
+
+fn handle_http_safe_tx_send(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { 
+
+    match http_request.method()?.as_str() {
+        "POST" => {
+
+        }
+        _ => { 
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]); 
+        }
+
+    }
+
+    Ok(()) 
 
 }
 
 fn handle_http_safe_signer(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
+
+fn get_nonce(safe: EthAddress) -> anyhow::Result<U256> {
+
+    let mut nonce_call_request = CallRequest::default();
+    nonce_call_request.input = CallInput::new(SafeL2::nonceCall::new(()).abi_encode().into());
+    nonce_call_request.to = Some(safe);
+
+    let nonce_result = call(nonce_call_request, None)?;
+    let nonce = SafeL2::nonceCall::abi_decode_returns(&nonce_result, false)?;
+
+    Ok(nonce._0)
+
+}
 
 fn subscribe_to_safe(
     our: &Address, 
