@@ -82,7 +82,7 @@ function App() {
     await fetch(`${BASE_URL}/safe/peer`, {
       method: "POST",
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({AddPeer:[safe, peer]})
+      body: JSON.stringify({AddPeers:[safe, [peer]]})
     })
   }
 
@@ -130,15 +130,20 @@ function App() {
                         }
                         break;
                       }
-                      case "AddPeer": {
+                      case "AddPeers": {
                         let addr = pkt[key][0]
-                        let peer = pkt[key][1]
+                        let peers = pkt[key][1]
                         let indx = safes.findIndex(s => s.address == addr)
-                        if (indx != -1) {
-                          if (!safes[indx].peers.find(p => p == peer)) {
+                        if (indx != -1 && !_.isEqual(safes[indx].peers, peers)) {
                             setSafes(prevSafes => prevSafes
-                              .map(s => s.address == addr ? {...s, peers: s.peers.concat(peer)} : s))
-                          }
+                              .map((s,ix) => {
+                                if (ix == indx)
+                                  for (let peer of peers)
+                                    if (!s.peers.find(p => p == peer)) 
+                                      s.peers.push(peer)
+                                return s
+                              })
+                            )
                         } else {
                           setSafes(prevSafes => prevSafes
                             .concat({address: pkt[key][0], peers: [pkt[key][1]]} as Safe))
@@ -151,7 +156,8 @@ function App() {
                         console.log("add owners", safe, owners)
                         let indx = safes.findIndex(s => s.address == safe.address)
                         if (indx != -1 && !_.isEqual(safes[indx].owners, owners)) {
-                          setSafes(prevSafes => prevSafes.map((s,ix) => { 
+                          setSafes(prevSafes => prevSafes
+                            .map((s,ix) => { 
                               if (ix == indx) { 
                                 for (let owner of owners) {
                                   if (!s.owners.find(o => o == owner)) {
@@ -160,7 +166,8 @@ function App() {
                                 }
                               } 
                               return s 
-                          }))
+                            })
+                          )
                         }
                         break;
                       }
