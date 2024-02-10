@@ -1,4 +1,6 @@
 use alloy_consensus::TxKind;
+use alloy_json_abi::{JsonAbi, Function};
+use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{Address as EthAddress, Bytes, FixedBytes, U8, U256};
 use alloy_rpc_types::{
     pubsub::{Params, SubscriptionKind, SubscriptionResult},
@@ -105,6 +107,7 @@ struct State {
     wallet: Option<Vec<u8>>,
 }
 
+
 struct Component;
 impl Guest for Component {
     fn init (our: String) {
@@ -123,13 +126,7 @@ impl Guest for Component {
 
             match &state.wallet {
                 Some(encrypted_wallet) => {
-
-                    println!("Enter password to unlock wallet:");
-                    let password_msg = await_message().unwrap();
-                    let password_str = String::from_utf8
-                        (password_msg.body().to_vec()).unwrap_or_else(|_| "".to_string());
-
-                    match decrypt_data(&encrypted_wallet, &password_str) {
+                    match decrypt_data(&encrypted_wallet, "password") {
                         Ok(decrypted_wallet) => match String::from_utf8(decrypted_wallet)
                             .ok()
                             .and_then(|wd| wd.parse::<LocalWallet>().ok())
@@ -151,11 +148,7 @@ impl Guest for Component {
                     let wallet_msg = await_message().unwrap();
                     let wallet_data_str = String::from_utf8(wallet_msg.body().to_vec()).unwrap();
 
-                    println!("Input a password to save it:");
-                    let password_msg = await_message().unwrap();
-                    let password_str = String::from_utf8(password_msg.body().to_vec()).unwrap();
-
-                    let encrypted_wallet_data = encrypt_data(wallet_data_str.as_bytes(), &password_str);
+                    let encrypted_wallet_data = encrypt_data(wallet_data_str.as_bytes(), "password");
                     state.wallet = Some(encrypted_wallet_data.clone());
 
                     if let Ok(live_wallet) = wallet_data_str.parse::<LocalWallet>() {
@@ -587,6 +580,12 @@ fn handle_http_safe_peer(
                 Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
                 Entry::Occupied(o) => {
 
+                    Request::new()
+                        .target((&our.node, "http_server", "distro", "sys"))
+                        .body(websocket_body(state.ws_channel)?)
+                        .blob(websocket_blob(serde_json::json!(&SafeActions::AddPeers(safe, peers.clone()))))
+                        .send()?;
+
                     for peer in peers {
 
                         state.peers.safe_to_nodes.entry(safe.clone()).or_default().insert(peer.clone());
@@ -596,6 +595,8 @@ fn handle_http_safe_peer(
                             .target(Address{node:peer.clone(), process:our.process.clone()})
                             .body(serde_json::to_vec(&SafeActions::AddSafe(safe))?)
                             .send()?;
+
+
                     }
 
                     http::send_response(http::StatusCode::OK, None, vec![])
