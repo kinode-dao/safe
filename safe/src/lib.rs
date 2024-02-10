@@ -49,7 +49,7 @@ enum SafeActions {
     AddPeers(EthAddress, Vec<NodeId>),
     AddOwners(EthAddress, Vec<EthAddress>),
     AddTxFrontend(EthAddress, EthAddress, u64),
-    AddTx(SafeTx),
+    AddTx(EthAddress, SafeTx),
     UpdateThreshold(EthAddress, u64),
 }
 
@@ -234,8 +234,8 @@ fn main(our: Address, mut state: State) -> Result<()> {
     http::bind_http_path("/safe", true, false).unwrap();
     http::bind_http_path("/safe/delegate", true, false).unwrap();
     http::bind_http_path("/safe/peer", true, false).unwrap();
-    http::bind_http_path("/safe/send", true, false).unwrap();
-    http::bind_http_path("/safe/signer", true, false).unwrap();
+    http::bind_http_path("/safe/tx", true, false).unwrap();
+    http::bind_http_path("/safe/tx/sign", true, false).unwrap();
     http::bind_http_path("/safes", true, false).unwrap();
     http::bind_http_path("/safes/peers", true, false).unwrap();
     http::bind_ws_path("/", true, false).unwrap();
@@ -356,6 +356,35 @@ fn handle_p2p_request(
             }
 
         }
+        Ok(SafeActions::AddTx(safe, tx)) => {
+
+            println!("add tx {:?}", tx);
+
+            match state.safes.entry(safe) {
+                Entry::Vacant(_) => {}
+                Entry::Occupied(mut o) => {
+
+                    println!("occupied");
+
+                    let txs_by_nonce = o.get_mut().txs.entry(tx.nonce).or_insert_with(Vec::new);
+
+                    if !txs_by_nonce.iter().any(|t| t.originator == tx.originator && t.timestamp == tx.timestamp) {
+
+                        txs_by_nonce.push(tx.clone());
+
+                        Request::new()
+                            .target((&our.node, "http_server", "distro", "sys"))
+                            .body(websocket_body(state.ws_channel)?)
+                            .blob(websocket_blob(serde_json::json!(&SafeActions::AddTx(safe, tx))))
+                            .send()?;
+
+                    }
+
+
+                }
+            }
+
+        }
         Err(e) => println!("Error: {:?}", e),
         _ => std::process::exit(1),
     }
@@ -424,8 +453,9 @@ fn handle_http_methods(
             "/safes/peers" => handle_http_safes_peers(our, state, http_request),
             "/safe/delegate" => handle_http_safe_delegate(our, state, http_request),
             "/safe/peer" => handle_http_safe_peer(our, state, http_request),
-            "/safe/send" => handle_http_safe_tx(our, state, http_request),
-            "/safe/signer" => handle_http_safe_signer(our, state, http_request),
+            "/safe/tx" => handle_http_safe_tx(our, state, http_request),
+            "/safe/tx/sign" => handle_http_safe_tx_sign(our, state, http_request),
+            "/safe/tx/send" => handle_http_safe_tx_send(our, state, http_request),
             &_ => Ok(http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]))
         };
     } 
@@ -615,17 +645,25 @@ fn handle_http_safe_delegate(our: &Address, state: &mut State, http_request: &ht
 
 fn handle_http_safe_tx(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { 
 
+    println!("handling http safe tx");
+
     match http_request.method()?.as_str() {
         "POST" => {
+
+            println!("post");
 
             let (safe, to, value) = match serde_json::from_slice::<SafeActions>(&get_blob().unwrap().bytes)? {
                 SafeActions::AddTxFrontend(safe, to, value) => (safe, to, value),
                 _ => std::process::exit(1),
             };
 
+            println!("safe: {:?}, to: {:?}, value: {:?}", safe, to, value);
+
             let _ = match state.safes.entry(safe) {
                 Entry::Vacant(_) => http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]),
                 Entry::Occupied(mut o) => {
+
+                    println!("occupied");
 
                     let estimate = estimate_gas(
                         CallRequest {
@@ -638,14 +676,18 @@ fn handle_http_safe_tx(our: &Address, state: &mut State, http_request: &http::In
                         None
                     ).unwrap();
 
+                    println!("estimate: {:?}", estimate);
+
                     let nonce = get_nonce(safe).unwrap();
+
+                    println!("nonce: {:?}", nonce);
 
                     let tx = SafeTx {
                         to: to,
                         value: U256::from(value),
                         data: Bytes::default(),
                         operation: U8::from(0),
-                        safe_tx_gas: U256::from(10000),
+                        safe_tx_gas: U256::from(30000),
                         base_gas: estimate,
                         gas_price: get_gas_price().unwrap(),
                         gas_token: EthAddress::default(),
@@ -655,19 +697,27 @@ fn handle_http_safe_tx(our: &Address, state: &mut State, http_request: &http::In
                         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
                     };
 
-                    let nonce_txs = o.get_mut().txs.get_mut(&nonce).unwrap();
+                    let nonce_txs = o.get_mut().txs.entry(nonce).or_insert_with(Vec::new);
                     nonce_txs.push(tx.clone());
 
                     let peers = state.peers.safe_to_nodes.get(&safe).unwrap();
 
                     for peer in peers {
 
+                        println!("sending to peer {:?}", peer);
+
                         let _ = Request::new()
                             .target(Address{node:peer.clone(), process:our.process.clone()})
-                            .body(serde_json::to_vec(&SafeActions::AddTx(tx.clone()))?)
+                            .body(serde_json::to_vec(&SafeActions::AddTx(safe, tx.clone()))?)
                             .send()?;
 
                     }
+
+                    Request::new()
+                        .target((&our.node, "http_server", "distro", "sys"))
+                        .body(websocket_body(state.ws_channel)?)
+                        .blob(websocket_blob(serde_json::json!(&SafeActions::AddTx(safe, tx))))
+                        .send()?;
 
                     http::send_response(http::StatusCode::OK, None, vec![])
 
@@ -715,8 +765,6 @@ fn handle_http_safe_tx_send(our: &Address, state: &mut State, http_request: &htt
     Ok(()) 
 
 }
-
-fn handle_http_safe_signer(our: &Address, state: &mut State, http_request: &http::IncomingHttpRequest) -> anyhow::Result<()> { Ok(()) }
 
 fn get_nonce(safe: EthAddress) -> anyhow::Result<U256> {
 
