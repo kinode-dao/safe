@@ -44,10 +44,25 @@ function App() {
     peers: string[],
     owners: string[],
     delegates: string[],
-    txs: string[],
+    txs: { [key: string]: SafeTx[] },
     tx_sigs: string[],
     threshold: number
   };
+
+  type SafeTx = {
+      to: string,
+      value: number,
+      data: string,
+      operation: number,
+      safe_tx_gas: number,
+      base_gas: number,
+      gas_price: number,
+      gas_token: string,
+      refund_receiver: string,
+      nonce: number,
+      originator: string,
+      timestamp: number,
+  }
 
   const [safes, setSafes] = useState<Safe[]>([]);
   const [newSafe, setNewSafe] = useState("");
@@ -68,10 +83,14 @@ function App() {
     }
   }
 
-  const sendDev = async () => {
+  const sendDev = async (safe, to) => {
 
     console.log("sending to dev")
-    let response = await fetch(`${BASE_URL}/safe/send`, { method: "POST", })
+    let response = await fetch(`${BASE_URL}/safe/tx`, { 
+      method: "POST", 
+      body: JSON.stringify({ AddTxFrontend: [safe, to, 1] })
+    })
+
     console.log("resposne", response);
     let json = await response.json();
     console.log("json", json);
@@ -89,17 +108,17 @@ function App() {
   // bootstrap
   useEffect(() => { (async() => {
 
-      let safes = []
-      let safes_response = await (await fetch(`${BASE_URL}/safes`, { method: "GET" })).json();
-      let peers_response = await (await fetch(`${BASE_URL}/safes/peers`, { method: "GET" })).json();
+    let safes = []
+    let safes_response = await (await fetch(`${BASE_URL}/safes`, { method: "GET" })).json();
+    let peers_response = await (await fetch(`${BASE_URL}/safes/peers`, { method: "GET" })).json();
 
-      for (let key in safes_response) {
-        let safe = { address: key, ...safes_response[key] }
-        if (peers_response[key]) safe.peers = peers_response[key]
-        safes.push(safe)
-      }
+    for (let key in safes_response) {
+      let safe = { address: key, ...safes_response[key] }
+      if (peers_response[key]) safe.peers = peers_response[key]
+      safes.push(safe)
+    }
 
-      setSafes(safes)
+    setSafes(safes)
 
   })()}, []);
 
@@ -123,10 +142,23 @@ function App() {
 
                   Object.keys(pkt).forEach(key => {
                     switch (key) {
-                      case "AddSafe": {
-                        if (!safes.find(s => s.address == pkt[key])) {
+                      case "AddOwners": {
+                        let safe = pkt[key][0]
+                        let owners = pkt[key][1]
+                        let indx = safes.findIndex(s => s.address == safe.address)
+                        if (indx != -1 && !_.isEqual(safes[indx].owners, owners)) {
                           setSafes(prevSafes => prevSafes
-                            .concat({address: pkt[key]} as Safe))
+                            .map((s,ix) => { 
+                              if (ix == indx) { 
+                                for (let owner of owners) {
+                                  if (!s.owners.find(o => o == owner)) {
+                                    s.owners.push(owner)
+                                  }
+                                }
+                              } 
+                              return s 
+                            })
+                          )
                         }
                         break;
                       }
@@ -150,25 +182,20 @@ function App() {
                         }
                         break;
                       }
-                      case "AddOwners": {
-                        let safe = pkt[key][0]
-                        let owners = pkt[key][1]
-                        console.log("add owners", safe, owners)
-                        let indx = safes.findIndex(s => s.address == safe.address)
-                        if (indx != -1 && !_.isEqual(safes[indx].owners, owners)) {
+                      case "AddSafe": {
+                        if (!safes.find(s => s.address == pkt[key])) {
                           setSafes(prevSafes => prevSafes
-                            .map((s,ix) => { 
-                              if (ix == indx) { 
-                                for (let owner of owners) {
-                                  if (!s.owners.find(o => o == owner)) {
-                                    s.owners.push(owner)
-                                  }
-                                }
-                              } 
-                              return s 
-                            })
-                          )
+                            .concat({address: pkt[key]} as Safe))
                         }
+                        break;
+                      }
+                      case "AddTx": {
+                        let addr = pkt[key][0]
+                        let tx = pkt[key][1]
+                        let indx = safes.findIndex(s => s.address == addr)
+                        console.log("TX", tx);
+                        // setSafes(prevSafes => prevSafes
+                        //   .map((s,ix) => ix == indx ? {...s, txs: s.txs.concat(tx)} : s))
                         break;
                       }
                       case "UpdateThreshold": {
@@ -197,6 +224,20 @@ function App() {
     }
   }, []);
 
+  const TxComponent = ({txs}: {txs: SafeTx[]}) => {
+    return (
+      <div>
+        <div> Nonce: {txs[0].nonce} </div>
+        { txs.map(tx => 
+          <div>
+            <p> To: {tx.to} </p>
+            <p> Value: {tx.value } </p>
+          </div>
+        ) }
+      </div>
+    )
+  }
+
   return (
     <div style={{ width: "100%" }}>
       <div style={{ position: "absolute", top: 4, left: 8 }}>
@@ -221,19 +262,23 @@ function App() {
           <button onClick={e=>addSafe(newSafe)}> Add safe </button>
         </div>
 
-        <div style={{ display: "flex", flexDirection: "row", border: "1px solid gray", }} >
-          <div style={{ flex: 1, borderRight: "1px solid gray", padding: "1em" }} >
-            <h3 style={{ marginTop: 0 }}>Safes</h3>
-          </div>
+        <div style={{ border: "1px solid gray", }} >
           { safes.map(safe => 
               <div> 
                 { safe.address } 
-                <div style={{ display: "flex", flexDirection: "row", border: "1px solid gray", }} >
-                  <input type="text" onInput={e=>setNewPeer((e.target as HTMLInputElement).value)} value={newPeer} />
-                  <button onClick={e=>addPeer(safe.address, newPeer )}>Add Peer</button>
-                  <button onClick={e=>sendDev()}>Send to dev</button>
+                <div style={{ display: "flex", flexDirection: "row", gap: "10px", border: "1px solid gray", }} >
+                  <div>
+                    <input type="text" onInput={e=>setNewPeer((e.target as HTMLInputElement).value)} value={newPeer} />
+                    <button onClick={e=>addPeer(safe.address, newPeer )}>Add Peer</button>
+                  </div>
+                  <div>
+                    <button onClick={e=>sendDev(safe.address, "0xB7b54cd129e6D8B24e6AE652a473449B273eE3E4")}>Send to dev</button>
+                  </div>
                 </div>
-                { safe.peers }
+                <div> { safe.peers } </div>
+                <div> txs: 
+                  { Object.keys(safe.txs).map(nonce => <TxComponent txs={safe.txs[nonce]}/>) }
+                </div>
               </div>
             ) 
           } 
