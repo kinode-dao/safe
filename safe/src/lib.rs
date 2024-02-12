@@ -4,7 +4,8 @@ use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{Address as EthAddress, Bytes, FixedBytes, U8, U256};
 use alloy_rpc_types::{
     pubsub::{Params, SubscriptionKind, SubscriptionResult},
-    BlockNumberOrTag, CallInput, CallRequest, Filter, Log,
+    request::{TransactionInput, TransactionRequest},
+    BlockNumberOrTag, Filter, Log,
 };
 use alloy_signer::{k256::ecdsa::SigningKey, LocalWallet, Signer, SignerSync, Transaction, Wallet};
 use alloy_sol_types::{sol, SolEvent, SolCall, SolValue, SolEnum};
@@ -53,7 +54,7 @@ enum SafeActions {
     UpdateThreshold(EthAddress, u64),
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
 struct SafeTx {
     to: EthAddress,
     value: U256,
@@ -65,8 +66,15 @@ struct SafeTx {
     gas_token: EthAddress,
     refund_receiver: EthAddress,
     nonce: U256,
-    originator: Address,
+    originator: Option<Address>,
     timestamp: u64,
+    signatures: Vec<SafeTxSig>
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+struct SafeTxSig  {
+    peer: NodeId,
+    sign: Bytes,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -74,7 +82,6 @@ struct Safe {
     address: EthAddress,
     owners: HashSet<EthAddress>,
     txs: BTreeMap<U256, Vec<SafeTx>>,
-    tx_sigs: BTreeMap<U256, Vec<Bytes>>,
     threshold: U256,
 }
 
@@ -119,9 +126,6 @@ impl Guest for Component {
             None => State::default()
         };
 
-        // this block is essentially a messy CLI initialization app,
-        // todo fix it up.
-        // also todo, save pk in file, store bookmarks etc in state.
         let mut wallet = loop {
 
             match &state.wallet {
@@ -144,11 +148,12 @@ impl Guest for Component {
                     }
                 }
                 None => {
-                    println!("No wallet loaded, input a key:");
+                    println!("No wallet loaded, input a key: {:?}", our.clone());
                     let wallet_msg = await_message().unwrap();
                     let wallet_data_str = String::from_utf8(wallet_msg.body().to_vec()).unwrap();
 
                     let encrypted_wallet_data = encrypt_data(wallet_data_str.as_bytes(), "password");
+
                     state.wallet = Some(encrypted_wallet_data.clone());
 
                     if let Ok(live_wallet) = wallet_data_str.parse::<LocalWallet>() {
@@ -211,7 +216,9 @@ fn main(our: Address, mut state: State) -> Result<()> {
         .events(vec!["ProxyCreation(address,address)"]);
 
     if state.block < get_block_number()? {
+        println!("getting logs");
         let logs = get_logs(safe_factory_filter.clone())?;
+        println!("got logs {:?}", logs.len());
         for log in logs {
             handle_factory_log(&our, &mut state, &log);
         }
@@ -224,11 +231,13 @@ fn main(our: Address, mut state: State) -> Result<()> {
     Request::new()
         .target((&our.node, "eth", "distro", "sys"))
         .body(serde_json::to_vec(&EthAction::SubscribeLogs {
-            sub_id: SAFE_FACTORY_SUB_ID,
+            sub_id: sub_handlers.len().try_into().unwrap(),
             kind,
             params,
         })?)
         .send()?;
+
+    println!("sent sub request");
 
     http::bind_http_path("/", true, false).unwrap();
     http::bind_http_path("/safe", true, false).unwrap();
@@ -272,6 +281,8 @@ fn handle_request(
     sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>> 
 ) -> anyhow::Result<()> {
 
+    println!("handling request");
+
     if !msg.is_request() {
         return Ok(());
     }
@@ -302,6 +313,8 @@ fn handle_eth_request(
     state: &mut State, 
     sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>> 
 ) -> anyhow::Result<()> {
+
+    println!("HANDLING ETH REQUEST");
 
     let Ok(res) = serde_json::from_slice::<EthResponse>(msg.body()) else {
         return Err(anyhow::anyhow!("safe: got invalid message"));
@@ -666,11 +679,11 @@ fn handle_http_safe_tx(our: &Address, state: &mut State, http_request: &http::In
                     println!("occupied");
 
                     let estimate = estimate_gas(
-                        CallRequest {
+                        TransactionRequest {
                             from: Some(safe),
                             to: Some(to),
                             value: Some(U256::from(value)),
-                            input: CallInput::new(Bytes::default()),
+                            input: TransactionInput::new(Bytes::default()),
                             ..Default::default()
                         },
                         None
@@ -693,8 +706,9 @@ fn handle_http_safe_tx(our: &Address, state: &mut State, http_request: &http::In
                         gas_token: EthAddress::default(),
                         refund_receiver: safe,
                         nonce: nonce.clone(),
-                        originator: our.clone(),
+                        originator: Some(our.clone()),
                         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+                        ..Default::default()
                     };
 
                     let nonce_txs = o.get_mut().txs.entry(nonce).or_insert_with(Vec::new);
@@ -768,8 +782,8 @@ fn handle_http_safe_tx_send(our: &Address, state: &mut State, http_request: &htt
 
 fn get_nonce(safe: EthAddress) -> anyhow::Result<U256> {
 
-    let mut nonce_call_request = CallRequest::default();
-    nonce_call_request.input = CallInput::new(SafeL2::nonceCall::new(()).abi_encode().into());
+    let mut nonce_call_request = TransactionRequest::default();
+    nonce_call_request.input = TransactionInput::new(SafeL2::nonceCall::new(()).abi_encode().into());
     nonce_call_request.to = Some(safe);
 
     let nonce_result = call(nonce_call_request, None)?;
@@ -788,8 +802,8 @@ fn subscribe_to_safe(
 
     let state_safe = state.safes.get_mut(&safe.clone()).unwrap();
 
-    let mut owners_call_request = CallRequest::default();
-    owners_call_request.input = CallInput::new(SafeL2::getOwnersCall::new(()).abi_encode().into());
+    let mut owners_call_request = TransactionRequest::default();
+    owners_call_request.input = TransactionInput::new(SafeL2::getOwnersCall::new(()).abi_encode().into());
     owners_call_request.to = Some(safe);
 
     let owners_result = call(owners_call_request, None)?;
@@ -797,8 +811,8 @@ fn subscribe_to_safe(
 
     for owner in owners._0 { state_safe.owners.insert(owner); }
 
-    let mut get_threshold_request = CallRequest::default();
-    get_threshold_request.input = CallInput::new(SafeL2::getThresholdCall::new(()).abi_encode().into());
+    let mut get_threshold_request = TransactionRequest::default();
+    get_threshold_request.input = TransactionInput::new(SafeL2::getThresholdCall::new(()).abi_encode().into());
     get_threshold_request.to = Some(safe);
 
     let threshold_result = call(get_threshold_request, None)?;
