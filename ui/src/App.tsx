@@ -62,6 +62,12 @@ function App() {
       nonce: number,
       originator: string,
       timestamp: number,
+      signatures: SafeTxSig[],
+  }
+
+  type SafeTxSig = { 
+    peer: string,
+    signature: string,
   }
 
   const [safes, setSafes] = useState<Safe[]>([]);
@@ -77,6 +83,8 @@ function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ AddSafe: safe })
     })
+
+    console.log("~~~SAFE!!!!", response);
 
     if (response.status == 200) {
       setSafes(safes.concat({ address: safe, } as Safe))
@@ -131,6 +139,7 @@ function App() {
         processId: window.our.process,
         onOpen: (_event, _api) => { },
         onMessage: (json: string | Blob) => {
+          console.log("GETTING MESAGE", json)
 
           if (typeof json === 'string') { } 
           else {
@@ -140,71 +149,76 @@ function App() {
                 try {
                   const pkt = JSON.parse(event.target.result);
 
+                  console.log("PKT!!!!", pkt)
+
                   Object.keys(pkt).forEach(key => {
                     switch (key) {
                       case "AddOwners": {
-                        let safe = pkt[key][0]
-                        let owners = pkt[key][1]
-                        let indx = safes.findIndex(s => s.address == safe.address)
-                        if (indx != -1 && !_.isEqual(safes[indx].owners, owners)) {
-                          setSafes(prevSafes => prevSafes
-                            .map((s,ix) => { 
-                              if (ix == indx) { 
-                                for (let owner of owners) {
-                                  if (!s.owners.find(o => o == owner)) {
-                                    s.owners.push(owner)
-                                  }
-                                }
-                              } 
-                              return s 
-                            })
-                          )
-                        }
+                        setSafes(prevSafes => {
+                          const newSafes = prevSafes.map(s => {
+                            if (s.address != pkt[key][0]) return s
+                            else {
+                              const newOwners = s.owners ? [...s.owners] : [];
+                              pkt[key][1].forEach(owner => {
+                                if (!newOwners.find(o => o == owner)) newOwners.push(owner)
+                              })
+                              return { ...s, owners: newOwners }
+                            }
+                          });
+                          return [ ...newSafes ]
+                        })
                         break;
                       }
                       case "AddPeers": {
-                        let addr = pkt[key][0]
-                        let peers = pkt[key][1]
-                        let indx = safes.findIndex(s => s.address == addr)
-                        if (indx != -1 && !_.isEqual(safes[indx].peers, peers)) {
-                            setSafes(prevSafes => prevSafes
-                              .map((s,ix) => {
-                                if (ix == indx)
-                                  for (let peer of peers)
-                                    if (!s.peers.find(p => p == peer)) 
-                                      s.peers.push(peer)
-                                return s
+                        console.log("adding peers");
+                        setSafes(prevSafes => {
+                          const newSafes = prevSafes.map(s => {
+                            if (s.address != pkt[key][0]) return s 
+                            else {
+                              const newPeers = s.peers ? [...s.peers] : [];
+                              pkt[key][1].forEach(peer => {
+                                if (!newPeers.find(p => p == peer)) newPeers.push(peer)
                               })
-                            )
-                        } else {
-                          setSafes(prevSafes => prevSafes
-                            .concat({address: pkt[key][0], peers: [pkt[key][1]]} as Safe))
-                        }
+                              return { ...s, peers: newPeers }
+                            }
+                          })
+                          return [ ...newSafes ]
+                        })
                         break;
                       }
                       case "AddSafe": {
-                        if (!safes.find(s => s.address == pkt[key])) {
-                          setSafes(prevSafes => prevSafes
-                            .concat({address: pkt[key]} as Safe))
-                        }
+                        console.log("adding safe", pkt, key);
+                        setSafes(prevSafes => {
+                          console.log("prevsafes", prevSafes);
+                          if (!prevSafes.some(s => s.address == pkt[key]))
+                            return [...prevSafes, {address: pkt[key]} as Safe]
+                          else 
+                            return prevSafes
+                        })
                         break;
                       }
                       case "AddTx": {
-                        let addr = pkt[key][0]
-                        let tx = pkt[key][1]
-                        let indx = safes.findIndex(s => s.address == addr)
-                        console.log("TX", tx);
-                        // setSafes(prevSafes => prevSafes
-                        //   .map((s,ix) => ix == indx ? {...s, txs: s.txs.concat(tx)} : s))
+                        setSafes(prevSafes => prevSafes.map(s => 
+                          s.address == pkt[key][0] 
+                            ? { ...s, 
+                                txs: {
+                                  ...s.txs,
+                                  [pkt[key][1].nonce]: s.txs && s.txs[pkt[key][1].nonce]
+                                    ? [...s.txs[pkt[key][1].nonce], pkt[key][1]]
+                                    : [pkt[key][1]]
+                                }
+                              }
+                            : s
+                        ));
                         break;
                       }
                       case "UpdateThreshold": {
-                        let safe = pkt[key][0]
-                        let threshold = pkt[key][1]
-                        console.log("update threshold", safe, threshold)
-                        let indx = safes.findIndex(s => s.address == safe.address)
-                        setSafes(prevSafes => prevSafes
-                          .map((s,ix) => ix == indx ? {...s, threshold: threshold} : s))
+                        setSafes(prevSafes => {
+                          console.log("PREVSAFES!!!!!!!!", prevSafes)
+                          const newSafes = prevSafes
+                            .map(s => s.address == pkt[key][0] ? { ...s, threshold: pkt[key][1] } : s)
+                          return [ ...newSafes ]
+                        })
                       }
                     }
                   })
@@ -232,11 +246,14 @@ function App() {
           <div>
             <p> To: {tx.to} </p>
             <p> Value: {tx.value } </p>
+            { txs[0].signatures.map(sig => <p> { "✅ " + sig.peer} </p>) } 
           </div>
         ) }
       </div>
     )
   }
+
+  console.log("SAFES!!!!!!", safes)
 
   return (
     <div style={{ width: "100%" }}>
@@ -265,7 +282,9 @@ function App() {
         <div style={{ border: "1px solid gray", }} >
           { safes.map(safe => 
               <div> 
-                { safe.address } 
+                { (console.log("SAFE!!!!!", safe, safe.threshold, safe.owners), <p/>)  }
+                <p> { safe.address } </p>
+                <p> { safe.threshold && safe.owners ? safe.threshold + "/" + safe.owners.length : null } </p> 
                 <div style={{ display: "flex", flexDirection: "row", gap: "10px", border: "1px solid gray", }} >
                   <div>
                     <input type="text" onInput={e=>setNewPeer((e.target as HTMLInputElement).value)} value={newPeer} />
@@ -275,9 +294,9 @@ function App() {
                     <button onClick={e=>sendDev(safe.address, "0xB7b54cd129e6D8B24e6AE652a473449B273eE3E4")}>Send to dev</button>
                   </div>
                 </div>
-                <div> { safe.peers } </div>
+                <div> { safe.peers || null } </div>
                 <div> txs: 
-                  { Object.keys(safe.txs).map(nonce => <TxComponent txs={safe.txs[nonce]}/>) }
+                  { safe.txs ? Object.keys(safe.txs).map(nonce => <TxComponent txs={safe.txs[nonce]}/>) : null }
                 </div>
               </div>
             ) 
