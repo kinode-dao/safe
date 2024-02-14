@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useWeb3React } from "@web3-react/core";
 import { hooks, metaMask } from "./connectors/metamask";
+import { ethers } from "ethers";
 import reactLogo from "./assets/react.svg";
 import viteLogo from "./assets/vite.svg";
 import NectarEncryptorApi from "@uqbar/client-encryptor-api";
@@ -78,17 +79,22 @@ function App() {
 
   const addSafe = async (safe) => {
 
+    const checksum = ethers.getAddress(safe);
+
+    console.log("CHECKSUM", checksum);
+
     let response = await fetch(`${BASE_URL}/safe`, {
       method: "POST",
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ AddSafe: safe })
+      body: JSON.stringify({ AddSafe: checksum })
     })
 
     console.log("~~~SAFE!!!!", response);
 
     if (response.status == 200) {
-      setSafes(safes.concat({ address: safe, } as Safe))
+      setSafes(safes.concat({ address: checksum } as Safe))
     }
+
   }
 
   const sendDev = async (safe, to) => {
@@ -110,6 +116,15 @@ function App() {
       method: "POST",
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({AddPeers:[safe, [peer]]})
+    })
+  }
+
+  const signTx = async (safe, nonce, originator, timestamp) => {
+
+    await fetch(`${BASE_URL}/safe/tx/sign`, {
+      method: "POST",
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({AddTxSig:[safe, nonce, originator, timestamp]})
     })
   }
 
@@ -154,26 +169,23 @@ function App() {
                   Object.keys(pkt).forEach(key => {
                     switch (key) {
                       case "AddOwners": {
-                        setSafes(prevSafes => {
-                          const newSafes = prevSafes.map(s => {
-                            if (s.address != pkt[key][0]) return s
-                            else {
-                              const newOwners = s.owners ? [...s.owners] : [];
-                              pkt[key][1].forEach(owner => {
-                                if (!newOwners.find(o => o == owner)) newOwners.push(owner)
-                              })
-                              return { ...s, owners: newOwners }
-                            }
-                          });
-                          return [ ...newSafes ]
-                        })
+                        const safe = ethers.getAddress(pkt[key][0]);
+                        setSafes(prevSafes => prevSafes.map(s => {
+                          if (s.address != safe) return s
+                          else {
+                            const newOwners = s.owners ? [...s.owners] : [];
+                            pkt[key][1].forEach(owner => {
+                              if (!newOwners.find(o => o == owner)) newOwners.push(owner)
+                            })
+                            return { ...s, owners: newOwners }
+                          }
+                        }))
                         break;
                       }
                       case "AddPeers": {
-                        console.log("adding peers");
-                        setSafes(prevSafes => {
-                          const newSafes = prevSafes.map(s => {
-                            if (s.address != pkt[key][0]) return s 
+                        const safe = ethers.getAddress(pkt[key][0]);
+                        setSafes(prevSafes => prevSafes.map(s => {
+                            if (s.address != safe) return s 
                             else {
                               const newPeers = s.peers ? [...s.peers] : [];
                               pkt[key][1].forEach(peer => {
@@ -181,17 +193,14 @@ function App() {
                               })
                               return { ...s, peers: newPeers }
                             }
-                          })
-                          return [ ...newSafes ]
-                        })
+                        }))
                         break;
                       }
                       case "AddSafe": {
-                        console.log("adding safe", pkt, key);
+                        const safe = ethers.getAddress(pkt[key]);
                         setSafes(prevSafes => {
-                          console.log("prevsafes", prevSafes);
-                          if (!prevSafes.some(s => s.address == pkt[key]))
-                            return [...prevSafes, {address: pkt[key]} as Safe]
+                          if (!prevSafes.some(s => s.address == safe))
+                            return [...prevSafes, {address: safe} as Safe]
                           else 
                             return prevSafes
                         })
@@ -213,12 +222,10 @@ function App() {
                         break;
                       }
                       case "UpdateThreshold": {
-                        setSafes(prevSafes => {
-                          console.log("PREVSAFES!!!!!!!!", prevSafes)
-                          const newSafes = prevSafes
-                            .map(s => s.address == pkt[key][0] ? { ...s, threshold: pkt[key][1] } : s)
-                          return [ ...newSafes ]
-                        })
+                        const safe = ethers.getAddress(pkt[key][0]);
+                        setSafes(prevSafes => prevSafes
+                            .map(s => s.address == safe ? { ...s, threshold: pkt[key][1] } : s)
+                        )
                       }
                     }
                   })
@@ -246,6 +253,7 @@ function App() {
           <div>
             <p> To: {tx.to} </p>
             <p> Value: {tx.value } </p>
+            <button onClick={e=> signTx(tx.nonce, tx.originator, tx.timestamp)}> Sign </button>
             { txs[0].signatures.map(sig => <p> { "✅ " + sig.peer} </p>) } 
           </div>
         ) }
