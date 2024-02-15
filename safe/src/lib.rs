@@ -49,6 +49,7 @@ enum SafeActions {
     AddOwnersFE(EthAddress, HashSet<EthAddress>),
     AddTxFE(EthAddress, EthAddress, u64), // safe, to and amount
     AddTxSigFE(EthAddress, U256, NodeId, u64, Bytes), // safe, nonce, orignator, timestamp, and amount
+    SendTxSigFE(EthAddress, U256, NodeId, u64), // safe, nonce, orignator, timestamp, and amount
     // outgoing/incoming to/from p2p
     // outgoing to frontend 
     UpdateSafe(Safe),
@@ -782,7 +783,24 @@ fn handle_http_safe_tx_send(
     http_request: &http::IncomingHttpRequest,
 ) -> anyhow::Result<()> {
     match http_request.method()?.as_str() {
-        "POST" => {}
+        "POST" => {
+            let Some(blob) = get_blob() else {
+                http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+                return Ok(());
+            };
+
+            let (safe, nonce, originator, timestamp) = match serde_json::from_slice::<SafeActions>(&blob.bytes) {
+                Ok(SafeActions::SendTxSigFE(safe, nonce, originator, timestamp)) => 
+                    ( safe, nonce, originator, timestamp),
+                Err(_) => std::process::exit(1),
+                _ => return Ok(()),
+            };
+
+            let state_safe = state.safes.get_mut(&safe).unwrap();
+            let state_txs = state_safe.txs.get_mut(&nonce).unwrap();
+            let state_tx = state_txs.iter_mut().find(|tx| tx.originator == Some(originator.clone()) && tx.timestamp == timestamp).unwrap();
+
+        }
         _ => {
             let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
         }
