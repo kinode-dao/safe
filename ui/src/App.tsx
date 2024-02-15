@@ -120,10 +120,22 @@ function App() {
     const sig = await signer.signMessage(tx.hash);
 
     const sig_response = await fetch(`${BASE_URL}/safe/tx/sign`, {
-      method: "PUT",
+      method: "POST",
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         AddTxSigFE:[safe, tx.nonce, tx.originator, tx.timestamp, sig]
+      })
+    })
+
+  }
+
+  const sendTx = async (safe, tx) => {
+
+    const send_response = await fetch(`${BASE_URL}/safe/tx/send`, {
+      method: "POST",
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        SendTxFE:[safe, tx.nonce, tx.originator, tx.timestamp]
       })
     })
 
@@ -155,12 +167,13 @@ function App() {
                 try {
 
                   const safe = JSON.parse(event.target.result)["UpdateSafe"];
+                  console.log("safe", safe)
                   setSafes(prevSafes => {
+                    console.log("prevsafes", prevSafes[0])
                     let indx = prevSafes.findIndex(s => s.address == safe.address);
-                    if (indx == -1) 
-                      return [ ...prevSafes, safe ];
-                    else 
-                      return [ ...prevSafes.slice(0, indx), safe, ...prevSafes.slice(indx + 1) ];
+                    return indx != -1
+                      ? [ ...prevSafes.slice(0, indx), safe, ...prevSafes.slice(indx + 1) ]
+                      : [ ...prevSafes, safe ];
                   })
 
                 } catch (error) {
@@ -183,12 +196,13 @@ function App() {
     return (
       <div key={txs[0].nonce}>
         <div> Nonce: {txs[0].nonce} </div>
-        { txs.map((tx,ix) => 
-          <div key={ix}>
+        { txs.map(tx => 
+          <div key={tx.timestamp}>
             <p> To: {tx.to} </p>
             <p> Value: {tx.value } </p>
             <button onClick={e=> signTx(safe, tx)}> Sign </button>
-            { tx.signatures.map(sig => <p> { "✅ " + sig.peer} </p>) } 
+            <button onClick={e=> sendTx(safe, tx)}> Send </button>
+            { tx.signatures.map((sig,ix) => <p key={ix}> { "✅ " + sig.peer} </p>) } 
           </div>
         ) }
       </div>
