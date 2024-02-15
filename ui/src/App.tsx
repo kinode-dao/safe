@@ -10,7 +10,7 @@ import Header from "./components/Header";
 import _ from "lodash";
 import "./App.css";
 
-const { useIsActivating, useChainId } = hooks;
+const { useProvider, useIsActivating, useChainId } = hooks;
 
 const BASE_URL = import.meta.env.BASE_URL;
 if (window.our) window.our.process = BASE_URL?.replace("/", "");
@@ -29,6 +29,7 @@ function App() {
   const { account, isActive } = useWeb3React()
   const isActivating = useIsActivating();
   const chainId = useChainId();
+  const provider = useProvider();
 
   console.log("account", account, "isActive", isActive);
   console.log("isActivating", isActivating, "chainId", chainId);
@@ -86,14 +87,8 @@ function App() {
     let response = await fetch(`${BASE_URL}/safe`, {
       method: "POST",
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ AddSafe: checksum })
+      body: JSON.stringify({ AddSafeFE: checksum })
     })
-
-    console.log("~~~SAFE!!!!", response);
-
-    if (response.status == 200) {
-      setSafes(safes.concat({ address: checksum } as Safe))
-    }
 
   }
 
@@ -102,7 +97,7 @@ function App() {
     console.log("sending to dev")
     let response = await fetch(`${BASE_URL}/safe/tx`, { 
       method: "POST", 
-      body: JSON.stringify({ AddTxFrontend: [safe, to, 1] })
+      body: JSON.stringify({ AddTxFE: [safe, to, 1] })
     })
 
     console.log("resposne", response);
@@ -115,33 +110,31 @@ function App() {
     await fetch(`${BASE_URL}/safe/peer`, {
       method: "POST",
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({AddPeers:[safe, [peer]]})
+      body: JSON.stringify({AddPeersFE:[safe, [peer]]})
     })
   }
 
-  const signTx = async (safe, nonce, originator, timestamp) => {
+  const signTx = async (safe, tx) => {
 
-    await fetch(`${BASE_URL}/safe/tx/sign`, {
-      method: "POST",
+    const signer = await provider.getSigner();
+    const sig = await signer.signMessage(tx.hash);
+
+    const sig_response = await fetch(`${BASE_URL}/safe/tx/sign`, {
+      method: "PUT",
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({AddTxSig:[safe, nonce, originator, timestamp]})
+      body: JSON.stringify({
+        AddTxSigFE:[safe, tx.nonce, tx.originator, tx.timestamp, sig]
+      })
     })
+
   }
 
   // bootstrap
   useEffect(() => { (async() => {
 
-    let safes = []
-    let safes_response = await (await fetch(`${BASE_URL}/safes`, { method: "GET" })).json();
-    let peers_response = await (await fetch(`${BASE_URL}/safes/peers`, { method: "GET" })).json();
+    let safes = await (await fetch(`${BASE_URL}/safes`, { method: "GET" })).json();
 
-    for (let key in safes_response) {
-      let safe = { address: key, ...safes_response[key] }
-      if (peers_response[key]) safe.peers = peers_response[key]
-      safes.push(safe)
-    }
-
-    setSafes(safes)
+    setSafes(Object.values(safes))
 
   })()}, []);
 
@@ -154,81 +147,22 @@ function App() {
         processId: window.our.process,
         onOpen: (_event, _api) => { },
         onMessage: (json: string | Blob) => {
-          console.log("GETTING MESAGE", json)
-
           if (typeof json === 'string') { } 
           else {
             const reader = new FileReader();
             reader.onload = function(event) {
               if (typeof event?.target?.result === 'string') {
                 try {
-                  const pkt = JSON.parse(event.target.result);
 
-                  console.log("PKT!!!!", pkt)
-
-                  Object.keys(pkt).forEach(key => {
-                    switch (key) {
-                      case "AddOwners": {
-                        const safe = ethers.getAddress(pkt[key][0]);
-                        setSafes(prevSafes => prevSafes.map(s => {
-                          if (s.address != safe) return s
-                          else {
-                            const newOwners = s.owners ? [...s.owners] : [];
-                            pkt[key][1].forEach(owner => {
-                              if (!newOwners.find(o => o == owner)) newOwners.push(owner)
-                            })
-                            return { ...s, owners: newOwners }
-                          }
-                        }))
-                        break;
-                      }
-                      case "AddPeers": {
-                        const safe = ethers.getAddress(pkt[key][0]);
-                        setSafes(prevSafes => prevSafes.map(s => {
-                            if (s.address != safe) return s 
-                            else {
-                              const newPeers = s.peers ? [...s.peers] : [];
-                              pkt[key][1].forEach(peer => {
-                                if (!newPeers.find(p => p == peer)) newPeers.push(peer)
-                              })
-                              return { ...s, peers: newPeers }
-                            }
-                        }))
-                        break;
-                      }
-                      case "AddSafe": {
-                        const safe = ethers.getAddress(pkt[key]);
-                        setSafes(prevSafes => {
-                          if (!prevSafes.some(s => s.address == safe))
-                            return [...prevSafes, {address: safe} as Safe]
-                          else 
-                            return prevSafes
-                        })
-                        break;
-                      }
-                      case "AddTx": {
-                        setSafes(prevSafes => prevSafes.map(s => 
-                          s.address == pkt[key][0] 
-                            ? { ...s, 
-                                txs: {
-                                  ...s.txs,
-                                  [pkt[key][1].nonce]: s.txs && s.txs[pkt[key][1].nonce]
-                                    ? [...s.txs[pkt[key][1].nonce], pkt[key][1]]
-                                    : [pkt[key][1]]
-                                }
-                              }
-                            : s
-                        ));
-                        break;
-                      }
-                      case "UpdateThreshold": {
-                        const safe = ethers.getAddress(pkt[key][0]);
-                        setSafes(prevSafes => prevSafes
-                            .map(s => s.address == safe ? { ...s, threshold: pkt[key][1] } : s)
-                        )
-                      }
-                    }
+                  const safe = JSON.parse(event.target.result)["UpdateSafe"];
+                  setSafes(prevSafes => {
+                    let indx = prevSafes.findIndex(s => s.address == safe.address);
+                    if (indx == -1) 
+                      return [ ...prevSafes, safe ];
+                    else 
+                      return [ ...prevSafes.slice(0, indx), safe, ...prevSafes.slice(indx + 1) ];
                   })
+
                 } catch (error) {
                   console.error("Error parsing WebSocket message", error);
                 }
@@ -245,16 +179,16 @@ function App() {
     }
   }, []);
 
-  const TxComponent = ({txs}: {txs: SafeTx[]}) => {
+  const TxComponent = ({txs, safe}: {txs: SafeTx[], safe: string}) => {
     return (
-      <div>
+      <div key={txs[0].nonce}>
         <div> Nonce: {txs[0].nonce} </div>
-        { txs.map(tx => 
-          <div>
+        { txs.map((tx,ix) => 
+          <div key={ix}>
             <p> To: {tx.to} </p>
             <p> Value: {tx.value } </p>
-            <button onClick={e=> signTx(tx.nonce, tx.originator, tx.timestamp)}> Sign </button>
-            { txs[0].signatures.map(sig => <p> { "✅ " + sig.peer} </p>) } 
+            <button onClick={e=> signTx(safe, tx)}> Sign </button>
+            { tx.signatures.map(sig => <p> { "✅ " + sig.peer} </p>) } 
           </div>
         ) }
       </div>
@@ -289,8 +223,7 @@ function App() {
 
         <div style={{ border: "1px solid gray", }} >
           { safes.map(safe => 
-              <div> 
-                { (console.log("SAFE!!!!!", safe, safe.threshold, safe.owners), <p/>)  }
+              <div key={safe.address}> 
                 <p> { safe.address } </p>
                 <p> { safe.threshold && safe.owners ? safe.threshold + "/" + safe.owners.length : null } </p> 
                 <div style={{ display: "flex", flexDirection: "row", gap: "10px", border: "1px solid gray", }} >
@@ -304,7 +237,7 @@ function App() {
                 </div>
                 <div> { safe.peers || null } </div>
                 <div> txs: 
-                  { safe.txs ? Object.keys(safe.txs).map(nonce => <TxComponent txs={safe.txs[nonce]}/>) : null }
+                  { safe.txs ? Object.keys(safe.txs).map(nonce => <TxComponent key={nonce} safe={safe.address} txs={safe.txs[nonce]}/>) : null }
                 </div>
               </div>
             ) 
