@@ -43,12 +43,15 @@ sol! {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 enum SafeActions {
-    AddSafe(EthAddress),
-    AddPeers(EthAddress, Vec<NodeId>),
-    AddOwners(EthAddress, Vec<EthAddress>),
-    AddTxFrontend(EthAddress, EthAddress, u64),
-    AddTx(EthAddress, SafeTx),
-    UpdateThreshold(EthAddress, u64),
+    // incoming from frontend
+    AddSafeFE(EthAddress),
+    AddPeersFE(EthAddress, HashSet<NodeId>),
+    AddOwnersFE(EthAddress, HashSet<EthAddress>),
+    AddTxFE(EthAddress, EthAddress, u64), // safe, to and amount
+    AddTxSigFE(EthAddress, U256, NodeId, u64, Bytes), // safe, nonce, orignator, timestamp, and amount
+    // outgoing/incoming to/from p2p
+    // outgoing to frontend 
+    UpdateSafe(Safe),
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -63,21 +66,23 @@ struct SafeTx {
     gas_token: EthAddress,
     refund_receiver: EthAddress,
     nonce: U256,
-    originator: Option<Address>,
+    originator: Option<NodeId>,
     timestamp: u64,
-    signatures: Vec<SafeTxSig>,
+    hash: FixedBytes<32>,
+    signatures: HashSet<SafeTxSig>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default, Eq, PartialEq, Hash)]
 struct SafeTxSig {
     peer: NodeId,
-    sign: Bytes,
+    sig: Bytes,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 struct Safe {
     address: EthAddress,
     owners: HashSet<EthAddress>,
+    peers: HashSet<NodeId>,
     txs: BTreeMap<U256, Vec<SafeTx>>,
     threshold: U256,
 }
@@ -316,68 +321,40 @@ fn handle_p2p_request(
     state: &mut State,
     sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>,
 ) -> anyhow::Result<()> {
+
     println!("handling p2p request {:?}", msg.body());
 
     match serde_json::from_slice::<SafeActions>(msg.body()) {
-        Ok(SafeActions::AddSafe(safe)) => match state.safes.entry(safe) {
-            Entry::Vacant(entry) => {
-                entry.insert(Safe::new(safe.clone()));
+        Ok(SafeActions::UpdateSafe(safe)) => {
 
-                subscribe_to_safe(&our, safe.clone(), state, sub_handlers)?;
+            let state_safe = state.safes.entry(safe.address.clone()).or_default();
 
-                let peer = msg.source().node.clone();
+            state_safe.address = safe.address;
+            state_safe.threshold = safe.threshold;
+            state_safe.owners.extend(safe.owners.iter().cloned());
 
-                state
-                    .peers
-                    .safe_to_nodes
-                    .entry(safe.clone())
-                    .or_default()
-                    .insert(peer.clone());
-                state
-                    .peers
-                    .node_to_safes
-                    .entry(peer.clone())
-                    .or_default()
-                    .insert(safe.clone());
+            state_safe.peers.extend(safe.peers.iter().cloned());
+            state_safe.peers.remove(&our.node);
+            state_safe.peers.insert(msg.source().node.clone());
 
-                Request::new()
-                    .target((&our.node, "http_server", "distro", "sys"))
-                    .body(websocket_body(state.ws_channel)?)
-                    .blob(websocket_blob(serde_json::json!(&SafeActions::AddPeers(
-                        safe,
-                        vec![peer]
-                    ))))
-                    .send()?;
-            }
-            Entry::Occupied(entry) => {}
-        },
-        Ok(SafeActions::AddTx(safe, tx)) => {
-            println!("add tx {:?}", tx);
-
-            match state.safes.entry(safe) {
-                Entry::Vacant(_) => {}
-                Entry::Occupied(mut o) => {
-                    println!("occupied");
-
-                    let txs_by_nonce = o.get_mut().txs.entry(tx.nonce).or_insert_with(Vec::new);
-
-                    if !txs_by_nonce
-                        .iter()
-                        .any(|t| t.originator == tx.originator && t.timestamp == tx.timestamp)
-                    {
-                        txs_by_nonce.push(tx.clone());
-
-                        Request::new()
-                            .target((&our.node, "http_server", "distro", "sys"))
-                            .body(websocket_body(state.ws_channel)?)
-                            .blob(websocket_blob(serde_json::json!(&SafeActions::AddTx(
-                                safe, tx
-                            ))))
-                            .send()?;
+            for (nonce, txs) in safe.txs {
+                let state_txs = state_safe.txs.entry(nonce).or_insert_with(Vec::new);
+                for tx in txs {
+                    if let Some(existing_tx) = state_txs.iter_mut().find(|t| t.originator == tx.originator && t.timestamp == tx.timestamp) {
+                        existing_tx.signatures.extend(tx.signatures);
+                    } else {
+                        state_txs.push(tx);
                     }
                 }
             }
-        }
+
+            Request::new()
+                .target((&our.node, "http_server", "distro", "sys"))
+                .body(websocket_body(state.ws_channel)?)
+                .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateSafe(state_safe.clone()))))
+                .send()?;
+
+        },
         Err(e) => println!("Error: {:?}", e),
         _ => std::process::exit(1),
     }
@@ -497,22 +474,40 @@ fn handle_http_safe(
             Ok(())
         }
         "POST" => {
+
+            println!("1");
+
             let Some(blob) = get_blob() else {
                 http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
                 return Ok(());
             };
 
+            println!("2 {:?}", blob);
+
             let safe = match serde_json::from_slice::<SafeActions>(&blob.bytes) {
-                Ok(SafeActions::AddSafe(safe)) => safe,
+                Ok(SafeActions::AddSafeFE(safe)) => safe,
                 Err(_) => std::process::exit(1),
                 _ => return Ok(()),
             };
 
+            println!("3 {:?}", safe);
+
+            if !state.safe_blocks.contains_key(&safe) {
+                let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+                return Ok(());
+            }
+
+            println!("4");
+
             match state.safes.entry(safe) {
                 Entry::Vacant(v) => {
+                    println!("5");
                     v.insert(Safe::new(safe));
+                    println!("6");
                     subscribe_to_safe(our, safe, state, sub_handlers)?;
+                    println!("7");
                     let _ = http::send_response(http::StatusCode::OK, None, vec![]);
+                    println!("8");
                 }
                 Entry::Occupied(_) => {
                     let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
@@ -584,7 +579,7 @@ fn handle_http_safe_peer(
         "POST" => {
             let (safe, peers) =
                 match serde_json::from_slice::<SafeActions>(&get_blob().unwrap().bytes)? {
-                    SafeActions::AddPeers(safe, peers) => (safe, peers),
+                    SafeActions::AddPeersFE(safe, peers) => (safe, peers),
                     _ => std::process::exit(1),
                 };
 
@@ -592,36 +587,22 @@ fn handle_http_safe_peer(
                 Entry::Vacant(_) => {
                     http::send_response(http::StatusCode::BAD_REQUEST, None, vec![])
                 }
-                Entry::Occupied(o) => {
+                Entry::Occupied(mut o) => {
+
+                    let state_safe = o.get_mut();
+
+                    state_safe.peers.extend(peers.clone());
+
                     Request::new()
                         .target((&our.node, "http_server", "distro", "sys"))
                         .body(websocket_body(state.ws_channel)?)
-                        .blob(websocket_blob(serde_json::json!(&SafeActions::AddPeers(
-                            safe,
-                            peers.clone()
-                        ))))
+                        .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateSafe(state_safe.clone()))))
                         .send()?;
 
-                    for peer in peers {
-                        state
-                            .peers
-                            .safe_to_nodes
-                            .entry(safe.clone())
-                            .or_default()
-                            .insert(peer.clone());
-                        state
-                            .peers
-                            .node_to_safes
-                            .entry(peer.clone())
-                            .or_default()
-                            .insert(safe.clone());
-
+                    for peer in &state_safe.peers {
                         Request::new()
-                            .target(Address {
-                                node: peer.clone(),
-                                process: our.process.clone(),
-                            })
-                            .body(serde_json::to_vec(&SafeActions::AddSafe(safe))?)
+                            .target(Address { node: peer.clone(), process: our.process.clone(), })
+                            .body(serde_json::to_vec(&SafeActions::UpdateSafe(state_safe.clone()))?)
                             .send()?;
                     }
 
@@ -657,7 +638,7 @@ fn handle_http_safe_tx(
 
             let (safe, to, value) =
                 match serde_json::from_slice::<SafeActions>(&get_blob().unwrap().bytes)? {
-                    SafeActions::AddTxFrontend(safe, to, value) => (safe, to, value),
+                    SafeActions::AddTxFE(safe, to, value) => (safe, to, value),
                     _ => std::process::exit(1),
                 };
 
@@ -688,7 +669,7 @@ fn handle_http_safe_tx(
 
                     println!("nonce: {:?}", nonce);
 
-                    let tx = SafeTx {
+                    let mut tx = SafeTx {
                         to: to,
                         value: U256::from(value),
                         data: Bytes::default(),
@@ -699,7 +680,7 @@ fn handle_http_safe_tx(
                         gas_token: EthAddress::default(),
                         refund_receiver: safe,
                         nonce: nonce.clone(),
-                        originator: Some(our.clone()),
+                        originator: Some(our.node.clone()),
                         timestamp: SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
@@ -707,29 +688,26 @@ fn handle_http_safe_tx(
                         ..Default::default()
                     };
 
-                    let nonce_txs = o.get_mut().txs.entry(nonce).or_insert_with(Vec::new);
+                    tx.hash = get_tx_hash(safe, tx.clone());
+
+                    let state_safe = o.get_mut();
+
+                    let nonce_txs = state_safe.txs.entry(nonce).or_insert_with(Vec::new);
                     nonce_txs.push(tx.clone());
 
-                    let peers = state.peers.safe_to_nodes.get(&safe).unwrap();
+                    for peer in &state_safe.peers {
 
-                    for peer in peers {
-                        println!("sending to peer {:?}", peer);
-
-                        let _ = Request::new()
-                            .target(Address {
-                                node: peer.clone(),
-                                process: our.process.clone(),
-                            })
-                            .body(serde_json::to_vec(&SafeActions::AddTx(safe, tx.clone()))?)
+                        Request::new()
+                            .target(Address { node: peer.clone(), process: our.process.clone(), })
+                            .body(serde_json::to_vec(&SafeActions::UpdateSafe(state_safe.clone()))?)
                             .send()?;
+
                     }
 
                     Request::new()
                         .target((&our.node, "http_server", "distro", "sys"))
                         .body(websocket_body(state.ws_channel)?)
-                        .blob(websocket_blob(serde_json::json!(&SafeActions::AddTx(
-                            safe, tx
-                        ))))
+                        .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateSafe(state_safe.clone()))))
                         .send()?;
 
                     http::send_response(http::StatusCode::OK, None, vec![])
@@ -750,8 +728,46 @@ fn handle_http_safe_tx_sign(
     state: &mut State,
     http_request: &http::IncomingHttpRequest,
 ) -> anyhow::Result<()> {
+
+    println!("handling http safe tx sign");
+
     match http_request.method()?.as_str() {
-        "POST" => {}
+        "GET" => { }
+        "POST" => {
+            let Some(blob) = get_blob() else {
+                http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+                return Ok(());
+            };
+
+            println!("blob {:?}", blob);
+
+            let (safe, nonce, originator, timestamp, sig) = match serde_json::from_slice::<SafeActions>(&blob.bytes) {
+                Ok(SafeActions::AddTxSigFE(safe, nonce, originator, timestamp, sig)) => 
+                    ( safe, nonce, originator, timestamp, sig),
+                Err(_) => std::process::exit(1),
+                _ => return Ok(()),
+            };
+
+            let state_safe = state.safes.get_mut(&safe).unwrap();
+            let state_txs = state_safe.txs.get_mut(&nonce).unwrap();
+            if let Some((index, tx)) = state_txs.iter_mut().enumerate().find(|(_, tx)| tx.originator == Some(originator.clone()) && tx.timestamp == timestamp) {
+                tx.signatures.insert(SafeTxSig { peer: our.node.clone(), sig: sig.clone() });
+            }
+
+            Request::new()
+                .target((&our.node, "http_server", "distro", "sys"))
+                .body(websocket_body(state.ws_channel)?)
+                .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateSafe(state_safe.clone()))))
+                .send()?;
+
+            for peer in &state_safe.peers {
+                Request::new()
+                    .target(Address { node: peer.clone(), process: our.process.clone(), })
+                    .body(serde_json::to_vec(&SafeActions::UpdateSafe(state_safe.clone()))?)
+                    .send()?;
+            }
+
+        }
         _ => {
             let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
         }
@@ -801,7 +817,14 @@ fn subscribe_to_safe(
     owners_call_request.to = Some(safe);
 
     let owners_result = call(owners_call_request, None)?;
-    let owners = SafeL2::getOwnersCall::abi_decode_returns(&owners_result, false)?;
+
+    let owners = match SafeL2::getOwnersCall::abi_decode_returns(&owners_result, false){
+        Ok(owners) => owners,
+        Err(e) => {
+            println!("Error: {:?}", e);
+            return Ok(())
+        }
+    } ;
 
     for owner in owners._0 {
         state_safe.owners.insert(owner);
@@ -820,18 +843,7 @@ fn subscribe_to_safe(
     Request::new()
         .target((&our.node, "http_server", "distro", "sys"))
         .body(websocket_body(state.ws_channel)?)
-        .blob(websocket_blob(serde_json::json!(&SafeActions::AddOwners(
-            safe,
-            state_safe.owners.clone().into_iter().collect()
-        ))))
-        .send()?;
-
-    Request::new()
-        .target((&our.node, "http_server", "distro", "sys"))
-        .body(websocket_body(state.ws_channel)?)
-        .blob(websocket_blob(serde_json::json!(
-            &SafeActions::UpdateThreshold(safe, state_safe.threshold.clone().to::<u64>())
-        )))
+        .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateSafe(state_safe.clone()))))
         .send()?;
 
     let added_owner_filter = Filter::new()
@@ -891,4 +903,33 @@ fn websocket_blob(json: serde_json::Value) -> LazyLoadBlob {
         mime: Some("application/json".to_string()),
         bytes: json.to_string().into_bytes(),
     }
+}
+
+fn get_tx_hash(safe: EthAddress, tx: SafeTx) -> FixedBytes<32> {
+
+    let mut get_tx_request = TransactionRequest::default();
+    get_tx_request.input =
+        TransactionInput::new(SafeL2::getTransactionHashCall::new((
+            tx.to.clone(),
+            tx.value.clone(),
+            tx.data.0.clone().to_vec(),
+            tx.operation.clone().to::<u8>(),
+            tx.safe_tx_gas.clone(),
+            tx.base_gas.clone(),
+            tx.gas_price.clone(),
+            tx.gas_token.clone(),
+            tx.refund_receiver.clone(),
+            tx.nonce.clone(),
+        )).abi_encode().into());
+    get_tx_request.to = Some(safe);
+
+    println!("get tx request {:?}", get_tx_request);
+
+    let tx_hash_result = call(get_tx_request, None).unwrap();
+    let tx_hash = SafeL2::getTransactionHashCall::abi_decode_returns(&tx_hash_result, false).unwrap();
+
+    println!("tx hash {:?}", tx_hash._0);
+
+    return tx_hash._0;
+
 }
