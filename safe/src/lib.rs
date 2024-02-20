@@ -13,8 +13,19 @@ use alloy_sol_types::{sol, SolCall, SolEnum, SolEvent, SolValue};
 use anyhow::Result;
 use kinode_process_lib::{
     await_message,
-    eth::{call, estimate_gas, get_block_number, get_gas_price, get_logs, EthAction, EthMessage},
     get_blob, get_state, http, println, set_state, Address, LazyLoadBlob, Message, NodeId, Request,
+    eth::{
+        call, 
+        estimate_gas, 
+        get_block_number, 
+        get_chain_id, 
+        get_gas_price, 
+        get_transaction_count, 
+        get_logs, 
+        send_raw_transaction, 
+        subscribe,
+        EthSub, 
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::{Entry, HashMap};
@@ -48,8 +59,8 @@ enum SafeActions {
     AddPeersFE(EthAddress, HashSet<NodeId>),
     AddOwnersFE(EthAddress, HashSet<EthAddress>),
     AddTxFE(EthAddress, EthAddress, u64), // safe, to and amount
-    AddTxSigFE(EthAddress, U256, NodeId, u64, Bytes), // safe, nonce, orignator, timestamp, and amount
-    SendTxSigFE(EthAddress, U256, NodeId, u64), // safe, nonce, orignator, timestamp, and amount
+    AddTxSigFE(EthAddress, U256, NodeId, u64, EthAddress, Bytes), // safe, nonce, orignator, timestamp, signer and signature
+    SendTxFE(EthAddress, U256, NodeId, u64), // safe, nonce, orignator, timestamp 
     // outgoing/incoming to/from p2p
     // outgoing to frontend 
     UpdateSafe(Safe),
@@ -76,6 +87,7 @@ struct SafeTx {
 #[derive(Clone, Serialize, Deserialize, Debug, Default, Eq, PartialEq, Hash)]
 struct SafeTxSig {
     peer: NodeId,
+    addr: EthAddress,
     sig: Bytes,
 }
 
@@ -169,7 +181,7 @@ impl Guest for Component {
 
         println!("wallet {:?}", wallet);
 
-        match main(our, state) {
+        match main(our, state, wallet) {
             Ok(_) => {}
             Err(e) => println!("Error: {:?}", e),
         };
@@ -196,7 +208,7 @@ fn handle_safe_removed_owner_log(our: &Address, state: &mut State, log: &Log) {
         .remove(&EthAddress::from_word(log.topics[1].into()));
 }
 
-fn main(our: Address, mut state: State) -> Result<()> {
+fn main(our: Address, mut state: State, mut wallet: Wallet<SigningKey>) -> Result<()> {
     let mut sub_handlers: HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>> =
         HashMap::new();
 
@@ -207,29 +219,18 @@ fn main(our: Address, mut state: State) -> Result<()> {
         .from_block(2087031)
         .events(vec!["ProxyCreation(address,address)"]);
 
-    if state.block < get_block_number()? {
-        println!("getting logs");
-        let logs = get_logs(safe_factory_filter.clone())?;
-        println!("got logs {:?}", logs.len());
-        for log in logs {
-            handle_factory_log(&our, &mut state, &log);
-        }
-    }
+    // if state.block < get_block_number()? {
+    //     println!("getting logs");
+    //     let logs = get_logs(&safe_factory_filter.clone())?;
+    //     println!("got logs {:?}", logs.len());
+    //     for log in logs {
+    //         handle_factory_log(&our, &mut state, &log);
+    //     }
+    // }
 
-    let params = Params::Logs(Box::new(safe_factory_filter));
-    let kind = SubscriptionKind::Logs;
-
-    sub_handlers.insert(
-        sub_handlers.len().try_into().unwrap(),
-        Box::new(handle_factory_log),
-    );
-    Request::new()
-        .target((&our.node, "eth", "distro", "sys"))
-        .body(serde_json::to_vec(&EthMessage {
-            id: sub_handlers.len().try_into().unwrap(),
-            action: EthAction::SubscribeLogs { kind, params },
-        })?)
-        .send()?;
+    let id = sub_handlers.len().try_into().unwrap();
+    sub_handlers.insert(id, Box::new(handle_factory_log));
+    subscribe(id, safe_factory_filter)?;
 
     println!("sent sub request");
 
@@ -239,6 +240,7 @@ fn main(our: Address, mut state: State) -> Result<()> {
     http::bind_http_path("/safe/peer", true, false).unwrap();
     http::bind_http_path("/safe/tx", true, false).unwrap();
     http::bind_http_path("/safe/tx/sign", true, false).unwrap();
+    http::bind_http_path("/safe/tx/send", true, false).unwrap();
     http::bind_http_path("/safes", true, false).unwrap();
     http::bind_http_path("/safes/peers", true, false).unwrap();
     http::bind_ws_path("/", true, false).unwrap();
@@ -249,7 +251,7 @@ fn main(our: Address, mut state: State) -> Result<()> {
         match await_message() {
             Ok(msg) => {
                 match msg.is_request() {
-                    true => handle_request(&our, &msg, &mut state, &mut sub_handlers)?,
+                    true => handle_request(&our, &msg, &mut state, &mut wallet, &mut sub_handlers)?,
                     false => handle_response(&our, &msg, &mut state)?,
                 }
                 let _ = set_state(&bincode::serialize(&state).unwrap());
@@ -270,6 +272,7 @@ fn handle_request(
     our: &Address,
     msg: &Message,
     state: &mut State,
+    wallet: &mut Wallet<SigningKey>,
     sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>,
 ) -> anyhow::Result<()> {
     println!("handling request");
@@ -283,7 +286,7 @@ fn handle_request(
     } else if msg.source().node == our.node && msg.source().process == "terminal:distro:sys" {
         let _ = handle_terminal_request(msg);
     } else if msg.source().node == our.node && msg.source().process == "http_server:distro:sys" {
-        let _ = handle_http_request(our, msg, state, sub_handlers);
+        let _ = handle_http_request(our, msg, state, wallet, sub_handlers);
     } else if msg.source().node == our.node && msg.source().process == "eth:distro:sys" {
         let _ = handle_eth_request(our, msg, state, sub_handlers);
     }
@@ -297,21 +300,16 @@ fn handle_eth_request(
     state: &mut State,
     sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>,
 ) -> anyhow::Result<()> {
-    println!("HANDLING ETH REQUEST");
 
-    let Ok(msg) = serde_json::from_slice::<EthMessage>(msg.body()) else {
-        return Err(anyhow::anyhow!("safe: got invalid message"));
+    println!("~~ eth request ~~");
+
+    let Ok(res) = serde_json::from_slice::<EthSub>(msg.body()) else {
+        return Err(anyhow::anyhow!("kns_indexer: got invalid message"));
     };
 
-    match msg.action {
-        EthAction::Sub { result } => match result {
-            SubscriptionResult::Log(log) => {
-                sub_handlers.get_mut(&msg.id).unwrap()(our, state, &log)
-            }
-            _ => {}
-        },
-        _ => {}
-    };
+    if let SubscriptionResult::Log(log) = res.result {
+        sub_handlers.get_mut(&res.id).unwrap()(our, state, &log);
+    }
 
     Ok(())
 }
@@ -372,13 +370,14 @@ fn handle_http_request(
     our: &Address,
     msg: &Message,
     state: &mut State,
+    wallet: &mut Wallet<SigningKey>,
     sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>,
 ) -> anyhow::Result<()> {
     println!("handling http request");
 
     match serde_json::from_slice::<http::HttpServerRequest>(msg.body())? {
         http::HttpServerRequest::Http(ref incoming) => {
-            match handle_http_methods(our, state, sub_handlers, incoming) {
+            match handle_http_methods(our, state, wallet, sub_handlers, incoming) {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     http::send_response(
@@ -403,6 +402,7 @@ fn handle_http_request(
 fn handle_http_methods(
     our: &Address,
     state: &mut State,
+    wallet: &mut Wallet<SigningKey>,
     sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>,
     http_request: &http::IncomingHttpRequest,
 ) -> anyhow::Result<()> {
@@ -417,7 +417,7 @@ fn handle_http_methods(
             "/safe/peer" => handle_http_safe_peer(our, state, http_request),
             "/safe/tx" => handle_http_safe_tx(our, state, http_request),
             "/safe/tx/sign" => handle_http_safe_tx_sign(our, state, http_request),
-            "/safe/tx/send" => handle_http_safe_tx_send(our, state, http_request),
+            "/safe/tx/send" => handle_http_safe_tx_send(our, state, wallet, http_request),
             &_ => Ok(http::send_response(
                 http::StatusCode::BAD_REQUEST,
                 None,
@@ -493,10 +493,10 @@ fn handle_http_safe(
 
             println!("3 {:?}", safe);
 
-            if !state.safe_blocks.contains_key(&safe) {
-                let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
-                return Ok(());
-            }
+            // if !state.safe_blocks.contains_key(&safe) {
+            //     let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+            //     return Ok(());
+            // }
 
             println!("4");
 
@@ -742,9 +742,9 @@ fn handle_http_safe_tx_sign(
 
             println!("blob {:?}", blob);
 
-            let (safe, nonce, originator, timestamp, sig) = match serde_json::from_slice::<SafeActions>(&blob.bytes) {
-                Ok(SafeActions::AddTxSigFE(safe, nonce, originator, timestamp, sig)) => 
-                    ( safe, nonce, originator, timestamp, sig),
+            let (safe, nonce, originator, timestamp, addr, sig) = match serde_json::from_slice::<SafeActions>(&blob.bytes) {
+                Ok(SafeActions::AddTxSigFE(safe, nonce, originator, timestamp, addr, sig)) => 
+                    ( safe, nonce, originator, timestamp, addr, sig),
                 Err(_) => std::process::exit(1),
                 _ => return Ok(()),
             };
@@ -752,7 +752,7 @@ fn handle_http_safe_tx_sign(
             let state_safe = state.safes.get_mut(&safe).unwrap();
             let state_txs = state_safe.txs.get_mut(&nonce).unwrap();
             if let Some((index, tx)) = state_txs.iter_mut().enumerate().find(|(_, tx)| tx.originator == Some(originator.clone()) && tx.timestamp == timestamp) {
-                tx.signatures.insert(SafeTxSig { peer: our.node.clone(), sig: sig.clone() });
+                tx.signatures.insert(SafeTxSig { peer: our.node.clone(), addr: addr.clone(), sig: sig.clone() });
             }
 
             Request::new()
@@ -780,17 +780,23 @@ fn handle_http_safe_tx_sign(
 fn handle_http_safe_tx_send(
     our: &Address,
     state: &mut State,
+    wallet: &mut Wallet<SigningKey>,
     http_request: &http::IncomingHttpRequest,
 ) -> anyhow::Result<()> {
     match http_request.method()?.as_str() {
         "POST" => {
+
+            println!("send");
+
             let Some(blob) = get_blob() else {
                 http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
                 return Ok(());
             };
 
+            println!("blob {:?}", blob);
+
             let (safe, nonce, originator, timestamp) = match serde_json::from_slice::<SafeActions>(&blob.bytes) {
-                Ok(SafeActions::SendTxSigFE(safe, nonce, originator, timestamp)) => 
+                Ok(SafeActions::SendTxFE(safe, nonce, originator, timestamp)) => 
                     ( safe, nonce, originator, timestamp),
                 Err(_) => std::process::exit(1),
                 _ => return Ok(()),
@@ -799,6 +805,57 @@ fn handle_http_safe_tx_send(
             let state_safe = state.safes.get_mut(&safe).unwrap();
             let state_txs = state_safe.txs.get_mut(&nonce).unwrap();
             let state_tx = state_txs.iter_mut().find(|tx| tx.originator == Some(originator.clone()) && tx.timestamp == timestamp).unwrap();
+
+            let mut sorted_sigs = state_tx.signatures.iter().cloned().collect::<Vec<SafeTxSig>>();
+            sorted_sigs.sort_by(|a,b| a.addr.cmp(&b.addr));
+
+            println!("sorted sigs {:?}", sorted_sigs);
+
+            let sig_bytes = sorted_sigs.iter().flat_map(|sig| sig.sig.clone().into_iter()).collect::<Vec<u8>>();
+
+            let wallet_nonce = get_transaction_count(wallet.address(), None).unwrap();
+            let chain_id = get_chain_id().unwrap();
+            let gas_price = get_gas_price().unwrap();
+
+            let execute_call = SafeL2::execTransactionCall::new((
+                state_tx.to.clone(),
+                state_tx.value.clone(),
+                state_tx.data.clone().to_vec(),
+                state_tx.operation.clone().to::<u8>(),
+                state_tx.safe_tx_gas.clone(),
+                state_tx.base_gas.clone(),
+                state_tx.gas_price.clone(),
+                state_tx.gas_token.clone(),
+                state_tx.refund_receiver.clone(),
+                sig_bytes
+            ));
+
+            let mut chain_tx = alloy_consensus::TxLegacy {
+                nonce: wallet_nonce.to::<u64>(),
+                gas_price: gas_price.to::<u128>(),
+                gas_limit: 100000,
+                to: TxKind::Call(state_safe.address), // Use `TxKind::Call` with the recipient's address
+                value: U256::from(0),
+                input: execute_call.abi_encode().into(),
+                chain_id: Some(chain_id.to::<u64>()),
+            };
+
+            let sig = wallet.sign_transaction_sync(&mut chain_tx).unwrap();
+            let signed_tx = chain_tx.into_signed(sig);
+
+            let mut buf = vec![];
+            signed_tx.encode_signed(&mut buf);
+
+            match send_raw_transaction(buf.into()) {
+                Ok(tx_hash) => {
+                    println!("sent! with tx_hash {:?}", tx_hash);
+                    let _ = http::send_response(http::StatusCode::OK, None, vec![]);
+                }
+                Err(e) => {
+                    println!("Error: {:?}", e);
+                    let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
+                }
+            }
 
         }
         _ => {
@@ -864,45 +921,23 @@ fn subscribe_to_safe(
         .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateSafe(state_safe.clone()))))
         .send()?;
 
+    let id = sub_handlers.len().try_into().unwrap();
     let added_owner_filter = Filter::new()
         .address(safe.clone())
         .from_block(BlockNumberOrTag::Latest)
         .events(vec![SafeL2::AddedOwner::SIGNATURE]);
 
-    sub_handlers.insert(
-        sub_handlers.len().try_into().unwrap(),
-        Box::new(handle_safe_added_owner_log),
-    );
-    Request::new()
-        .target((&our.node, "eth", "distro", "sys"))
-        .body(serde_json::to_vec(&EthMessage {
-            id: sub_handlers.len().try_into().unwrap(),
-            action: EthAction::SubscribeLogs {
-                kind: SubscriptionKind::Logs,
-                params: Params::Logs(Box::new(added_owner_filter)),
-            },
-        })?)
-        .send()?;
+    sub_handlers.insert(id, Box::new(handle_safe_added_owner_log));
+    subscribe(id, added_owner_filter)?;
 
+    let id = sub_handlers.len().try_into().unwrap();
     let removed_owner_filter = Filter::new()
         .address(safe.clone())
         .from_block(BlockNumberOrTag::Latest)
         .events(vec![SafeL2::RemovedOwner::SIGNATURE]);
 
-    sub_handlers.insert(
-        sub_handlers.len().try_into().unwrap(),
-        Box::new(handle_safe_removed_owner_log),
-    );
-    Request::new()
-        .target((&our.node, "eth", "distro", "sys"))
-        .body(serde_json::to_vec(&EthMessage {
-            id: sub_handlers.len().try_into().unwrap(),
-            action: EthAction::SubscribeLogs {
-                kind: SubscriptionKind::Logs,
-                params: Params::Logs(Box::new(removed_owner_filter)),
-            },
-        })?)
-        .send()?;
+    sub_handlers.insert(id, Box::new(handle_safe_removed_owner_log));
+    subscribe(id, removed_owner_filter)?;
 
     Ok(())
 }

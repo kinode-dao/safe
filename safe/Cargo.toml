@@ -19,7 +19,7 @@ alloy-json-abi = "0.6.2"
 alloy-primitives = "0.6.2"
 bincode = "1.3.3"
 hex = "0.4"
-kinode_process_lib = { git = "https://github.com/kinode-dao/process_lib", rev = "1e14a03" }
+kinode_process_lib = { git = "https://github.com/kinode-dao/process_lib", rev = "34cf6bd" }
 rand = "0.8.5"
 rust-crypto-wasm = "0.3.1"
 serde = { version = "1.0", features = ["derive"] }
