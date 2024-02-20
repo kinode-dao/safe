@@ -116,14 +116,53 @@ function App() {
 
   const signTx = async (safe, tx) => {
 
+    const EIP712_SAFE_TX_DOMAIN = { 
+      chainId: chainId, 
+      verifyingContract: safe 
+    };
+
+    // "SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)"
+    const EIP712_SAFE_TX_TYPE = {
+      SafeTx: [
+          { type: "address", name: "to" },
+          { type: "uint256", name: "value" },
+          { type: "bytes", name: "data" },
+          { type: "uint8", name: "operation" },
+          { type: "uint256", name: "safeTxGas" },
+          { type: "uint256", name: "baseGas" },
+          { type: "uint256", name: "gasPrice" },
+          { type: "address", name: "gasToken" },
+          { type: "address", name: "refundReceiver" },
+          { type: "uint256", name: "nonce" },
+      ],
+    };
+
+    const EIP712_SAFE_TX_VALUE = {
+        to: tx.to,
+        value: BigInt(tx.value),
+        data: tx.data,
+        operation: BigInt(tx.operation),
+        safeTxGas: BigInt(tx.safe_tx_gas),
+        baseGas: BigInt(tx.base_gas),
+        gasPrice: BigInt(tx.gas_price),
+        gasToken: tx.gas_token,
+        refundReceiver: tx.refund_receiver,
+        nonce: BigInt(tx.nonce)
+    }
+
     const signer = await provider.getSigner();
-    const sig = await signer.signMessage(tx.hash);
+    const addr = await signer.getAddress();
+    const sig = await signer._signTypedData(
+      EIP712_SAFE_TX_DOMAIN, 
+      EIP712_SAFE_TX_TYPE, 
+      EIP712_SAFE_TX_VALUE
+    );
 
     const sig_response = await fetch(`${BASE_URL}/safe/tx/sign`, {
       method: "POST",
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        AddTxSigFE:[safe, tx.nonce, tx.originator, tx.timestamp, sig]
+        AddTxSigFE:[safe, tx.nonce, tx.originator, tx.timestamp, addr, sig]
       })
     })
 
