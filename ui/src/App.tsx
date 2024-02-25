@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { useWeb3React } from "@web3-react/core";
 import { hooks, metaMask } from "./connectors/metamask";
 import { ethers } from "ethers";
+import Modal from "react-modal"
 import reactLogo from "./assets/react.svg";
 import viteLogo from "./assets/vite.svg";
 import NectarEncryptorApi from "@uqbar/client-encryptor-api";
@@ -77,6 +78,12 @@ function App() {
   const [newPeer, setNewPeer] = useState("");
   const [newSigner, setNewSigner] = useState("");
   const [newDelegate, setNewDelegate] = useState("");
+
+  const [jsonAbi, setJsonAbi] = useState([]);
+  const [jsonAbiIndex, setJsonAbiIndex] = useState("0");
+  const [buildingTx, setBuildingTx] = useState(false);
+  const buildTxModal = () => setBuildingTx(true);
+  const doneTxModal = () => setBuildingTx(false);
 
   const addSafe = async (safe) => {
 
@@ -203,20 +210,29 @@ function App() {
             const reader = new FileReader();
             reader.onload = function(event) {
               if (typeof event?.target?.result === 'string') {
-                try {
 
-                  const safe = JSON.parse(event.target.result)["UpdateSafe"];
-                  console.log("safe", safe)
-                  setSafes(prevSafes => {
-                    console.log("prevsafes", prevSafes[0])
-                    let indx = prevSafes.findIndex(s => s.address == safe.address);
-                    return indx != -1
-                      ? [ ...prevSafes.slice(0, indx), safe, ...prevSafes.slice(indx + 1) ]
-                      : [ ...prevSafes, safe ];
-                  })
+                const json = JSON.parse(event.target.result);
 
-                } catch (error) {
-                  console.error("Error parsing WebSocket message", error);
+                if (json["UpdateSafe"]) {
+
+                  try {
+
+                    const safe = json["UpdateSafe"];
+                    setSafes(prevSafes => {
+                      let indx = prevSafes.findIndex(s => s.address == safe.address);
+                      return indx != -1
+                        ? [ ...prevSafes.slice(0, indx), safe, ...prevSafes.slice(indx + 1) ]
+                        : [ ...prevSafes, safe ];
+                    })
+
+                  } catch (error) {
+                    console.error("Error parsing WebSocket message", error);
+                  }
+
+                } else {
+
+                  console.log("message", json);
+
                 }
               }
             };
@@ -224,12 +240,112 @@ function App() {
           }
         },
       });
-
       setApi(api);
     } else {
       setNodeConnected(false);
     }
   }, []);
+
+  const ingestAbi = async (safe, abi) => {
+
+    const body = JSON.stringify({ BuildTxFE: [ safe, abi ] });
+
+    let response = await fetch(`${BASE_URL}/safe/tx/build`, { 
+      method: "POST",
+      body: body
+    });
+
+
+  }
+
+  const jsonAbiUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const text = e.target?.result;
+      try {
+        const data = JSON.parse(text as string);
+        setJsonAbi(data.abi ? data.abi : data);
+      } catch (err) {
+        console.log("err", err);
+      }
+    }
+    reader.readAsText(file)
+  }
+
+  const txBuilderStyles = {
+    content: {
+      top: "50%",
+      left: "50%",
+      right: "auto",
+      bottom: "auto",
+      marginRight: "-50%",
+      transform: "translate(-50%, -50%)",
+      width: "80%",
+      height: "80%",
+      display: "flex",
+      flexDirection: "column",
+      justifyContent: "center",
+      alignItems: "center",
+      border: "1px solid black",
+      padding: "20px",
+      color: "white",
+      backgroundColor: "#353535",
+    },
+    overlay: {
+      backgroundColor: "transparent",
+    }
+  }
+  interface TxBuilderProps { safe: Safe; }
+  const TxBuilder = ({safe}: TxBuilderProps) => {
+    return (
+      <div>
+        <p>Building Tx!</p>
+        <p>
+          <label htmlFor="jsonAbi">Upload ABI</label> <br/>
+          <input type="file" id="jsonAbi" onChange={jsonAbiUpload}/>
+        </p>
+        { jsonAbi ?
+          <div> 
+            Select From:
+            <select value={jsonAbiIndex} onChange={(e) => setJsonAbiIndex(e.target.value) }>
+            { jsonAbi.map((item, ix) => 
+                item.type == "function" ?
+                  <option key={ix} value={ix}> 
+                    { item.name }
+                    { item.inputs.length ? "(" : null }
+                    { item.inputs.length 
+                      ? item.inputs.map((input, indx) => 
+                          <span>
+                            { input.name ? input.name + " ": null }
+                            { input.type }
+                            { indx != item.inputs.length - 1 ? ',  ' : null } 
+                          </span>
+                        ) 
+                      : null
+                    }
+                    { item.inputs.length ? ")" : null }
+                  </option> : null
+              )
+            }
+            </select>
+            { jsonAbi[jsonAbiIndex] ? 
+                <p>
+                  { jsonAbi[jsonAbiIndex].name }
+                  { jsonAbi[jsonAbiIndex].inputs.map(input => <>
+                    <label> { input.name ? input.name : input.type } </label>
+                    <input placeholder={input.type} /> 
+                  </>
+                  )}
+                </p> : null
+            }
+          </div>
+          : null
+        }
+      </div>
+    )
+  }
 
   const TxComponent = ({txs, safe}: {txs: SafeTx[], safe: string}) => {
     return (
@@ -239,8 +355,9 @@ function App() {
           <div key={tx.timestamp}>
             <p> To: {tx.to} </p>
             <p> Value: {tx.value } </p>
-            <button onClick={e=> signTx(safe, tx)}> Sign </button>
+            <p> Data: { tx.data } </p>
             <button onClick={e=> sendTx(safe, tx)}> Send </button>
+            <button onClick={e=> signTx(safe, tx)}> Sign </button>
             { tx.signatures.map((sig,ix) => <p key={ix}> { "✅ " + sig.peer} </p>) } 
           </div>
         ) }
@@ -248,7 +365,7 @@ function App() {
     )
   }
 
-  console.log("SAFES!!!!!!", safes)
+  console.log("json abi index", jsonAbiIndex)
 
   return (
     <div style={{ width: "100%" }}>
@@ -279,6 +396,12 @@ function App() {
               <div key={safe.address}> 
                 <p> { safe.address } </p>
                 <p> { safe.threshold && safe.owners ? safe.threshold + "/" + safe.owners.length : null } </p> 
+                <div>
+                  <button onClick={buildTxModal}> Build Tx </button>
+                  <Modal style={txBuilderStyles} isOpen={buildingTx} onRequestClose={doneTxModal}>
+                    <TxBuilder safe={safe} />
+                  </Modal>
+                </div>
                 <div style={{ display: "flex", flexDirection: "row", gap: "10px", border: "1px solid gray", }} >
                   <div>
                     <input type="text" onInput={e=>setNewPeer((e.target as HTMLInputElement).value)} value={newPeer} />
