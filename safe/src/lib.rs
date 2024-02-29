@@ -1,6 +1,6 @@
 use alloy_consensus::TxKind;
-use alloy_dyn_abi::{DynSolType, DynSolValue};
-use alloy_json_abi::{Function, JsonAbi};
+use alloy_dyn_abi::{DynSolType, DynSolValue, JsonAbiExt};
+use alloy_json_abi::{Function, AbiItem, JsonAbi};
 use alloy_primitives::{Address as EthAddress, Bytes, FixedBytes, U256, U8};
 use alloy_rpc_types::{
     pubsub::{Params, SubscriptionKind, SubscriptionResult},
@@ -48,9 +48,7 @@ wit_bindgen::generate!({
 const SAFE_FACTORY_SUB_ID: u64 = 1;
 
 sol!(SafeL2, "./SafeL2.json");
-sol! {
-    event ProxyCreation(address proxy, address singleton);
-}
+sol!{ event ProxyCreation(address proxy, address singleton); }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 enum SafeActions {
@@ -59,6 +57,7 @@ enum SafeActions {
     AddPeersFE(EthAddress, HashSet<NodeId>),
     AddOwnersFE(EthAddress, HashSet<EthAddress>),
     AddTxFE(EthAddress, EthAddress, u64), // safe, to and amount
+    BuildTxFE(EthAddress, EthAddress, u64, Option<Function>, Option<serde_json::Value>), // safe, json abi, json abi args
     AddTxSigFE(EthAddress, U256, NodeId, u64, EthAddress, Bytes), // safe, nonce, orignator, timestamp, signer and signature
     SendTxFE(EthAddress, U256, NodeId, u64), // safe, nonce, orignator, timestamp 
     // outgoing/incoming to/from p2p
@@ -66,7 +65,7 @@ enum SafeActions {
     UpdateSafe(Safe),
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct SafeTx {
     to: EthAddress,
     value: U256,
@@ -80,8 +79,36 @@ struct SafeTx {
     nonce: U256,
     originator: Option<NodeId>,
     timestamp: u64,
-    hash: FixedBytes<32>,
     signatures: HashSet<SafeTxSig>,
+    abi: Option<Function>,
+    abi_args: Option<serde_json::Value>,
+}
+impl SafeTx {
+    fn to_tuple(&self) -> (
+        EthAddress,
+        U256,
+        Vec<u8>,
+        u8,
+        U256,
+        U256,
+        U256,
+        EthAddress,
+        EthAddress,
+        U256,
+    ) {
+        (
+            self.to,
+            self.value,
+            self.data.0.clone().to_vec(),
+            self.operation.to::<u8>(),
+            self.safe_tx_gas,
+            self.base_gas,
+            self.gas_price,
+            self.gas_token,
+            self.refund_receiver,
+            self.nonce,
+        )
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, Eq, PartialEq, Hash)]
@@ -239,6 +266,7 @@ fn main(our: Address, mut state: State, mut wallet: Wallet<SigningKey>) -> Resul
     http::bind_http_path("/safe/delegate", true, false).unwrap();
     http::bind_http_path("/safe/peer", true, false).unwrap();
     http::bind_http_path("/safe/tx", true, false).unwrap();
+    http::bind_http_path("/safe/tx/build", true, false).unwrap();
     http::bind_http_path("/safe/tx/sign", true, false).unwrap();
     http::bind_http_path("/safe/tx/send", true, false).unwrap();
     http::bind_http_path("/safes", true, false).unwrap();
@@ -406,6 +434,9 @@ fn handle_http_methods(
     sub_handlers: &mut HashMap<u64, Box<dyn FnMut(&Address, &mut State, &Log) + Send>>,
     http_request: &http::IncomingHttpRequest,
 ) -> anyhow::Result<()> {
+
+    println!("methods");
+
     if let Ok(path) = http_request.path() {
         println!("http path: {:?}, method: {:?}", path, http_request.method());
         let _ = match &path[..] {
@@ -416,6 +447,7 @@ fn handle_http_methods(
             "/safe/delegate" => handle_http_safe_delegate(our, state, http_request),
             "/safe/peer" => handle_http_safe_peer(our, state, http_request),
             "/safe/tx" => handle_http_safe_tx(our, state, http_request),
+            "/safe/tx/build" => handle_http_safe_tx_build(our, state, http_request),
             "/safe/tx/sign" => handle_http_safe_tx_sign(our, state, http_request),
             "/safe/tx/send" => handle_http_safe_tx_send(our, state, wallet, http_request),
             &_ => Ok(http::send_response(
@@ -626,6 +658,75 @@ fn handle_http_safe_delegate(
     Ok(())
 }
 
+fn handle_http_safe_tx_build(
+    our: &Address,
+    state: &mut State,
+    http_request: &http::IncomingHttpRequest,
+) -> anyhow::Result<()> {
+
+    println!("http safe tx build");
+
+    match http_request.method()?.as_str() {
+        "POST" => {
+
+            println!("post, {:?}", get_blob());
+
+            match serde_json::from_slice::<SafeActions>(&get_blob().unwrap().bytes) {
+                Ok(action) => match action {
+                    SafeActions::BuildTxFE(safe, to, value,abi, args) => {
+
+                        let _ = match state.safes.entry(safe) {
+                            Entry::Vacant(_) => {
+                                http::send_response(http::StatusCode::BAD_REQUEST, None, vec![])
+                            }
+                            Entry::Occupied(mut o) => {
+                                println!("occupied");
+
+                                let tx = get_tx(&our, safe, to, value, abi, args);
+
+                                let state_safe = o.get_mut();
+
+                                let nonce_txs = state_safe.txs.entry(tx.nonce).or_insert_with(Vec::new);
+                                nonce_txs.push(tx.clone());
+
+                                for peer in &state_safe.peers {
+
+                                    Request::new()
+                                        .target(Address { node: peer.clone(), process: our.process.clone(), })
+                                        .body(serde_json::to_vec(&SafeActions::UpdateSafe(state_safe.clone()))?)
+                                        .send()?;
+
+                                }
+
+                                Request::new()
+                                    .target((&our.node, "http_server", "distro", "sys"))
+                                    .body(websocket_body(state.ws_channel)?)
+                                    .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateSafe(state_safe.clone()))))
+                                    .send()?;
+
+                                http::send_response(http::StatusCode::OK, None, vec![])
+                            }
+                        };
+
+                    },
+                    _ => std::process::exit(1),
+                },
+                Err(e) => {
+                    println!("Error ~ ~ : {:?}", e);
+                    return Ok(());
+                }
+            }
+
+        }
+        _ => {
+            let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
+        }
+    }
+
+    Ok(())
+
+}
+
 fn handle_http_safe_tx(
     our: &Address,
     state: &mut State,
@@ -645,75 +746,6 @@ fn handle_http_safe_tx(
 
             println!("safe: {:?}, to: {:?}, value: {:?}", safe, to, value);
 
-            let _ = match state.safes.entry(safe) {
-                Entry::Vacant(_) => {
-                    http::send_response(http::StatusCode::BAD_REQUEST, None, vec![])
-                }
-                Entry::Occupied(mut o) => {
-                    println!("occupied");
-
-                    let estimate = estimate_gas(
-                        TransactionRequest {
-                            from: Some(safe),
-                            to: Some(to),
-                            value: Some(U256::from(value)),
-                            input: TransactionInput::new(Bytes::default()),
-                            ..Default::default()
-                        },
-                        None,
-                    )
-                    .unwrap();
-
-                    println!("estimate: {:?}", estimate);
-
-                    let nonce = get_nonce(safe).unwrap();
-
-                    println!("nonce: {:?}", nonce);
-
-                    let mut tx = SafeTx {
-                        to: to,
-                        value: U256::from(value),
-                        data: Bytes::default(),
-                        operation: U8::from(0),
-                        safe_tx_gas: U256::from(30000),
-                        base_gas: estimate,
-                        gas_price: get_gas_price().unwrap(),
-                        gas_token: EthAddress::default(),
-                        refund_receiver: safe,
-                        nonce: nonce.clone(),
-                        originator: Some(our.node.clone()),
-                        timestamp: SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                        ..Default::default()
-                    };
-
-                    tx.hash = get_tx_hash(safe, tx.clone());
-
-                    let state_safe = o.get_mut();
-
-                    let nonce_txs = state_safe.txs.entry(nonce).or_insert_with(Vec::new);
-                    nonce_txs.push(tx.clone());
-
-                    for peer in &state_safe.peers {
-
-                        Request::new()
-                            .target(Address { node: peer.clone(), process: our.process.clone(), })
-                            .body(serde_json::to_vec(&SafeActions::UpdateSafe(state_safe.clone()))?)
-                            .send()?;
-
-                    }
-
-                    Request::new()
-                        .target((&our.node, "http_server", "distro", "sys"))
-                        .body(websocket_body(state.ws_channel)?)
-                        .blob(websocket_blob(serde_json::json!(&SafeActions::UpdateSafe(state_safe.clone()))))
-                        .send()?;
-
-                    http::send_response(http::StatusCode::OK, None, vec![])
-                }
-            };
         }
         _ => {
             let _ = http::send_response(http::StatusCode::METHOD_NOT_ALLOWED, None, vec![]);
@@ -958,31 +990,115 @@ fn websocket_blob(json: serde_json::Value) -> LazyLoadBlob {
     }
 }
 
-fn get_tx_hash(safe: EthAddress, tx: SafeTx) -> FixedBytes<32> {
+fn get_tx_data(abi: &Option<Function>, args: &Option<serde_json::Value>) -> Bytes {
 
-    let mut get_tx_request = TransactionRequest::default();
-    get_tx_request.input =
-        TransactionInput::new(SafeL2::getTransactionHashCall::new((
-            tx.to.clone(),
-            tx.value.clone(),
-            tx.data.0.clone().to_vec(),
-            tx.operation.clone().to::<u8>(),
-            tx.safe_tx_gas.clone(),
-            tx.base_gas.clone(),
-            tx.gas_price.clone(),
-            tx.gas_token.clone(),
-            tx.refund_receiver.clone(),
-            tx.nonce.clone(),
-        )).abi_encode().into());
-    get_tx_request.to = Some(safe);
+    match abi {
+        Some(abi) => {
 
-    println!("get tx request {:?}", get_tx_request);
+            let inputs = args.clone().unwrap();
 
-    let tx_hash_result = call(get_tx_request, None).unwrap();
-    let tx_hash = SafeL2::getTransactionHashCall::abi_decode_returns(&tx_hash_result, false).unwrap();
+            let values = abi.inputs.iter().zip(inputs.as_array().unwrap_or(&vec![])).map(|(input, arg)| {
 
-    println!("tx hash {:?}", tx_hash._0);
+                match input.ty.as_str() {
+                    "uint256" => match arg.as_u64() {
+                        Some(val) => DynSolValue::Uint(U256::from(val), 256),
+                        None => panic!("Expected u256 value"),
+                    },
+                    "address" => match arg.as_str() {
+                        Some(addr) => EthAddress::from_str(addr).unwrap().into(),
+                        None => panic!("Expected address value"),
+                    }
+                    "bytes" => match arg.as_str() {
+                        Some(hex_str) => DynSolValue::Bytes(hex::decode(hex_str.trim_start_matches("0x")).unwrap()),
+                        None => panic!("Exptected bytes value"),
+                    }
+                    "bytes32" | "bytes4" => match arg.as_str() {
+                        Some(hex_str) => {
+                            let bytes = hex::decode(hex_str).unwrap();
+                            DynSolValue::FixedBytes(FixedBytes::from_slice(&bytes), bytes.len())
+                        },
+                        None => panic!("Expected a fixed bytes value"),
+                    },
+                    "bytes[]" => match arg.as_array() {
+                        Some(arr) => {
+                            let bytes_vec = arr.iter().map(|hex_str| {
+                                hex::decode(hex_str.as_str().unwrap()).unwrap()
+                            }).map(DynSolValue::Bytes).collect();
+                            DynSolValue::Array(bytes_vec)
+                        },
+                        None => DynSolValue::Array(vec![]),
+                    },
+                    "bool" => match arg.as_bool() {
+                        Some(val) => DynSolValue::Bool(val),
+                        None => panic!("Expected a bool value"),
+                    },
+                    _ => unimplemented!("Type {} not implemented", input.ty),
+                }
+            }).collect::<Vec<DynSolValue>>();
 
-    return tx_hash._0;
+            return abi.abi_encode_input(&values).unwrap().into();
+
+        },
+        None => {
+            Bytes::default()
+        }
+    }
+
+}
+
+fn get_tx(
+    our: &Address, 
+    safe: EthAddress, 
+    to: EthAddress, 
+    value: u64, 
+    abi: Option<Function>, 
+    args: Option<serde_json::Value>
+) -> SafeTx {
+
+    let tx_data = get_tx_data(&abi, &args);
+
+    println!("from {:?}", safe);
+    println!("to {:?}", to);
+    println!("input {:?}", tx_data.clone());
+
+    let estimate = match estimate_gas(
+        TransactionRequest {
+            from: Some(safe),
+            to: Some(to),
+            value: Some(U256::from(value)),
+            input: TransactionInput::new(tx_data.clone()),
+            ..Default::default()
+        },
+        None,
+    ) {
+        Ok(estimate) => estimate,
+        Err(e) => { 
+            println!("Err ~ ~ ~ {:?}", e); 
+            std::process::exit(1); 
+        },
+    };
+
+    let nonce = get_nonce(safe).unwrap();
+
+    SafeTx {
+        to: to,
+        value: U256::from(value),
+        data: tx_data,
+        operation: U8::from(0),
+        safe_tx_gas: U256::from(30000),
+        base_gas: estimate,
+        gas_price: get_gas_price().unwrap(),
+        gas_token: EthAddress::default(),
+        refund_receiver: safe,
+        nonce: nonce,
+        originator: Some(our.node.clone()),
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        abi: abi,
+        abi_args: args,
+        signatures: HashSet::new(),
+    }
 
 }
