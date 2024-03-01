@@ -1,0 +1,14 @@
+{
+    "name": "safe",
+    "description": "",
+    "image": "",
+    "properties": {
+        "package_name": "safe",
+        "current_version": "0.1.0",
+        "publisher": "jurassics.os",
+        "mirrors": [],
+        "code_hashes": { "0.1.0": "" }
+    },
+    "external_url": "",
+    "animation_url": ""
+}
