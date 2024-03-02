@@ -246,6 +246,7 @@ fn main(our: Address, mut state: State, mut wallet: Wallet<SigningKey>) -> Resul
         .from_block(2087031)
         .events(vec!["ProxyCreation(address,address)"]);
 
+    // TODO: requires more nuanced implementation due to possible RPC rate limiting
     // if state.block < get_block_number()? {
     //     println!("getting logs");
     //     let logs = get_logs(&safe_factory_filter.clone())?;
@@ -508,14 +509,10 @@ fn handle_http_safe(
         }
         "POST" => {
 
-            println!("1");
-
             let Some(blob) = get_blob() else {
                 http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
                 return Ok(());
             };
-
-            println!("2 {:?}", blob);
 
             let safe = match serde_json::from_slice::<SafeActions>(&blob.bytes) {
                 Ok(SafeActions::AddSafeFE(safe)) => safe,
@@ -523,24 +520,17 @@ fn handle_http_safe(
                 _ => return Ok(()),
             };
 
-            println!("3 {:?}", safe);
-
+            // TODO: requires more nuanced handling due to possible RPC provider limits
             // if !state.safe_blocks.contains_key(&safe) {
             //     let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
             //     return Ok(());
             // }
 
-            println!("4");
-
             match state.safes.entry(safe) {
                 Entry::Vacant(v) => {
-                    println!("5");
                     v.insert(Safe::new(safe));
-                    println!("6");
                     subscribe_to_safe(our, safe, state, sub_handlers)?;
-                    println!("7");
                     let _ = http::send_response(http::StatusCode::OK, None, vec![]);
-                    println!("8");
                 }
                 Entry::Occupied(_) => {
                     let _ = http::send_response(http::StatusCode::BAD_REQUEST, None, vec![]);
@@ -616,6 +606,8 @@ fn handle_http_safe_peer(
                     _ => std::process::exit(1),
                 };
 
+            println!("safe {:?}, peers {:?}", safe, peers);
+
             let _ = match state.safes.entry(safe) {
                 Entry::Vacant(_) => {
                     http::send_response(http::StatusCode::BAD_REQUEST, None, vec![])
@@ -633,10 +625,14 @@ fn handle_http_safe_peer(
                         .send()?;
 
                     for peer in &state_safe.peers {
+
+                        println!("peer {:?}", peer);
+
                         Request::new()
                             .target(Address { node: peer.clone(), process: our.process.clone(), })
                             .body(serde_json::to_vec(&SafeActions::UpdateSafe(state_safe.clone()))?)
                             .send()?;
+
                     }
 
                     http::send_response(http::StatusCode::OK, None, vec![])
@@ -861,11 +857,28 @@ fn handle_http_safe_tx_send(
                 state_tx.refund_receiver.clone(),
                 sig_bytes
             ));
+            
+            let estimate = match estimate_gas(
+                TransactionRequest {
+                    from: Some(wallet.address()),
+                    to: Some(state_safe.address),
+                    value: None,
+                    input: TransactionInput::new(execute_call.abi_encode().into()),
+                    ..Default::default()
+                },
+                None,
+            ) {
+                Ok(estimate) => estimate,
+                Err(e) => { 
+                    println!("Err ~ ~ ~ {:?}", e); 
+                    std::process::exit(1); 
+                },
+            };
 
             let mut chain_tx = alloy_consensus::TxLegacy {
                 nonce: wallet_nonce.to::<u64>(),
                 gas_price: gas_price.to::<u128>(),
-                gas_limit: 100000,
+                gas_limit: estimate.to::<u64>(),
                 to: TxKind::Call(state_safe.address), // Use `TxKind::Call` with the recipient's address
                 value: U256::from(0),
                 input: execute_call.abi_encode().into(),
@@ -1057,10 +1070,6 @@ fn get_tx(
 
     let tx_data = get_tx_data(&abi, &args);
 
-    println!("from {:?}", safe);
-    println!("to {:?}", to);
-    println!("input {:?}", tx_data.clone());
-
     let estimate = match estimate_gas(
         TransactionRequest {
             from: Some(safe),
@@ -1085,8 +1094,10 @@ fn get_tx(
         value: U256::from(value),
         data: tx_data,
         operation: U8::from(0),
-        safe_tx_gas: U256::from(30000),
-        base_gas: estimate,
+        // gas for the smart contract call
+        safe_tx_gas: estimate, 
+        // gas for whole transaction
+        base_gas: estimate + U256::from(30000),
         gas_price: get_gas_price().unwrap(),
         gas_token: EthAddress::default(),
         refund_receiver: safe,
