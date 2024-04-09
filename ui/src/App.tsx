@@ -9,7 +9,7 @@ import NectarEncryptorApi from "@uqbar/client-encryptor-api";
 import ConnectWallet from "./components/ConnectWallet";
 import Header from "./components/Header";
 import _ from "lodash";
-import "./App.css";
+import backgroundImage from "./assets/background.jpg";
 
 const { useProvider, useIsActivating, useChainId } = hooks;
 
@@ -66,6 +66,23 @@ function App() {
       originator: string,
       timestamp: number,
       signatures: SafeTxSig[],
+      // NOTICE: for when this is a call. 
+      // TODO: may be empty bytes in which case just a tx replacement/raw send
+      // TODO: may also just be bytes, need a way to indicate that
+      abi: FunctionAbi,
+      abi_args: [],
+  }
+
+  type FunctionAbi = { 
+    inputs: FunctionInput[],
+    name: string,
+    stateMutability: string,
+    type: string
+  }
+
+  type FunctionInput = {
+    name: string,
+    type: string,
   }
 
   type SafeTxSig = { 
@@ -74,22 +91,38 @@ function App() {
   }
 
   const [safes, setSafes] = useState<Safe[]>([]);
+  const [safeIndex, setSafeIndex] = useState(0);
   const [newSafe, setNewSafe] = useState("");
   const [newPeer, setNewPeer] = useState("");
   const [newSigner, setNewSigner] = useState("");
   const [newDelegate, setNewDelegate] = useState("");
 
+  const [to, setTo] = useState("0xC5a939923E0B336642024b479502E039338bEd00");
+  const [value, setValue] = useState(0);
   const [jsonAbi, setJsonAbi] = useState([]);
   const [jsonAbiIndex, setJsonAbiIndex] = useState("0");
+  const [jsonAbiArgs, setJsonAbiArgs] = useState([]);
   const [buildingTx, setBuildingTx] = useState(false);
   const buildTxModal = () => setBuildingTx(true);
   const doneTxModal = () => setBuildingTx(false);
 
+  const setJsonAbiWithIndex = (e) => {
+    const indx = e.target.value;
+    setJsonAbiIndex(indx)
+    setJsonAbiArgs(new Array(jsonAbi[indx].inputs.length))
+  }
+
+  const setJsonAbiArgsAtIndex = (e, ix) => {
+    setJsonAbiArgs(old => [
+      ...old.slice(0, ix),
+      e.target.value,
+      ...old.slice(ix+1)
+    ])
+  }
+
   const addSafe = async (safe) => {
 
     const checksum = ethers.getAddress(safe);
-
-    console.log("CHECKSUM", checksum);
 
     let response = await fetch(`${BASE_URL}/safe`, {
       method: "POST",
@@ -101,15 +134,12 @@ function App() {
 
   const sendDev = async (safe, to) => {
 
-    console.log("sending to dev")
     let response = await fetch(`${BASE_URL}/safe/tx`, { 
       method: "POST", 
       body: JSON.stringify({ AddTxFE: [safe, to, 1] })
     })
 
-    console.log("resposne", response);
     let json = await response.json();
-    console.log("json", json);
 
   }
 
@@ -192,9 +222,30 @@ function App() {
 
     let safes = await (await fetch(`${BASE_URL}/safes`, { method: "GET" })).json();
 
+    console.log("SAFES!", safes)
+
     setSafes(Object.values(safes))
 
   })()}, []);
+
+  useEffect(() => { (async () => {
+    if (ethers.isAddress(newSafe)) {
+
+      const addr = ethers.getAddress(newSafe)
+      let indx = safes.findIndex(safe => safe.address == addr)
+
+      if (indx == -1) {
+        let response = await fetch(`${BASE_URL}/safe`, {
+          method: "POST",
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ AddSafeFE: addr })
+        })
+      } else {
+        setSafeIndex(indx)
+      }
+
+    }
+  })()}, [newSafe]);
 
   useEffect(() => {
     // Connect to the nectar node via websocket
@@ -246,15 +297,24 @@ function App() {
     }
   }, []);
 
-  const ingestAbi = async (safe, abi) => {
+  const buildTx = async (safe, to, value, abi, inputs) => {
 
-    const body = JSON.stringify({ BuildTxFE: [ safe, abi ] });
+    const pterodactyl = ethers.dnsEncode("bronzeemperor.os")
+
+    console.log("pt", pterodactyl)
+
+    const body = JSON.stringify({ BuildTxFE: [
+      safe.address,
+      to,
+      value,
+      abi,
+      inputs
+    ] });
 
     let response = await fetch(`${BASE_URL}/safe/tx/build`, { 
       method: "POST",
       body: body
     });
-
 
   }
 
@@ -292,6 +352,7 @@ function App() {
       padding: "20px",
       color: "white",
       backgroundColor: "#353535",
+      background: `url(${backgroundImage}) no-repeat center center fixed`,
     },
     overlay: {
       backgroundColor: "transparent",
@@ -302,6 +363,14 @@ function App() {
     return (
       <div>
         <p>Building Tx!</p>
+        <p> 
+          <label htmlFor="to"> To </label>
+          <input type="text" id="to" value={to} onChange={(e) => setTo(e.target.value) }/>
+        </p>
+        <p> 
+          <label htmlFor="value"> Value </label>
+          <input type="number" id="to" value={value} onChange={(e) => setValue(Number(e.target.value)) }/>
+        </p>
         <p>
           <label htmlFor="jsonAbi">Upload ABI</label> <br/>
           <input type="file" id="jsonAbi" onChange={jsonAbiUpload}/>
@@ -309,7 +378,7 @@ function App() {
         { jsonAbi ?
           <div> 
             Select From:
-            <select value={jsonAbiIndex} onChange={(e) => setJsonAbiIndex(e.target.value) }>
+            <select value={jsonAbiIndex} onChange={setJsonAbiWithIndex}>
             { jsonAbi.map((item, ix) => 
                 item.type == "function" ?
                   <option key={ix} value={ix}> 
@@ -322,7 +391,7 @@ function App() {
                             { input.type }
                             { indx != item.inputs.length - 1 ? ',  ' : null } 
                           </span>
-                        ) 
+                        )
                       : null
                     }
                     { item.inputs.length ? ")" : null }
@@ -333,16 +402,18 @@ function App() {
             { jsonAbi[jsonAbiIndex] ? 
                 <p>
                   { jsonAbi[jsonAbiIndex].name }
-                  { jsonAbi[jsonAbiIndex].inputs.map(input => <>
-                    <label> { input.name ? input.name : input.type } </label>
-                    <input placeholder={input.type} /> 
-                  </>
+                  { jsonAbi[jsonAbiIndex].inputs.map((input, ix) => 
+                    <>
+                      <label> { input.name ? input.name : input.type } </label>
+                      <input value={jsonAbiArgs[ix]} placeholder={input.type} onChange={(e) => setJsonAbiArgsAtIndex(e, ix)} /> 
+                    </>
                   )}
                 </p> : null
             }
           </div>
           : null
         }
+        <button onClick={()=> buildTx(safe, to, value, jsonAbi[jsonAbiIndex], jsonAbiArgs)}> Build Tx </button>
       </div>
     )
   }
@@ -355,9 +426,23 @@ function App() {
           <div key={tx.timestamp}>
             <p> To: {tx.to} </p>
             <p> Value: {tx.value } </p>
-            <p> Data: { tx.data } </p>
-            <button onClick={e=> sendTx(safe, tx)}> Send </button>
+            { tx.abi ? 
+              <div> Call: { tx.abi.name + ( tx.abi.inputs ? "(" + tx.abi.inputs.map(input=> input.type) + ")" : "" ) }
+                <div style={{"paddingLeft": "10px"}}> 
+                  { tx.abi ? tx.abi.inputs.map((input, ix) => 
+                    <p key={ix}>
+                      { input.name ? input.name + ": " : "" }
+                      { tx.abi_args[ix] }
+                    </p> 
+                  ) : null }
+
+                </div>
+              </div>
+             : null }
+            <p> Created By: { tx.originator } </p>
+            <p> Created At: { tx.timestamp } </p>
             <button onClick={e=> signTx(safe, tx)}> Sign </button>
+            <button onClick={e=> sendTx(safe, tx)}> Send </button>
             { tx.signatures.map((sig,ix) => <p key={ix}> { "✅ " + sig.peer} </p>) } 
           </div>
         ) }
@@ -365,15 +450,21 @@ function App() {
     )
   }
 
-  console.log("json abi index", jsonAbiIndex)
+  const safe = safes[safeIndex]
+
+  console.log("safe", safe)
 
   return (
     <div style={{ width: "100%" }}>
+
       <div style={{ position: "absolute", top: 4, left: 8 }}>
         ID: <strong>{window.our?.node}</strong>
       </div>
-      <Header {...{openConnect, closeConnect, msg: "Header" }} />
+
+      <Header {...{openConnect, closeConnect, msg: "Kinode Safe" }} />
+
       <ConnectWallet {...{connectOpen, closeConnect}} />
+
       {!nodeConnected && (
         <div className="node-not-connected">
           <h2 style={{ color: "red" }}>Node not connected</h2>
@@ -383,43 +474,46 @@ function App() {
           </h4>
         </div>
       )}
-      <h2>Simple Safe app on Uqbar</h2>
-      <div className="card">
 
-        <div style={{ display: "flex", flexDirection: "row", border: "1px solid gray", }} >
-          <input type="text" onInput={e=>setNewSafe((e.target as HTMLInputElement).value)} value={newSafe} />
-          <button onClick={e=>addSafe(newSafe)}> Add safe </button>
-        </div>
+      <div>
+        {/* <div style={{ padding: "25px", width: "75%", display: "flex", flexDirection:"row", justifyContent: "center", margin: "0 auto" }} >
+          <input 
+            type="text" 
+            placeholder="Select Safe" 
+            value={newSafe} 
+            onInput={e=>setNewSafe((e.target as HTMLInputElement).value)} 
+          />
+          <button onClick={e=>addSafe(newSafe)}> Select Safe </button>
+        </div> */}
 
-        <div style={{ border: "1px solid gray", }} >
-          { safes.map(safe => 
-              <div key={safe.address}> 
+        { safe ? 
+          <div style={{ border: "1px solid gray", }} >
+            <div style={{display: "flex", flexDirection: "row", alignItems: "center", justifyContent: "center" }}> 
+              <div style={{width: "50%"}}> 
                 <p> { safe.address } </p>
                 <p> { safe.threshold && safe.owners ? safe.threshold + "/" + safe.owners.length : null } </p> 
+                <p> { safe.peers || null } </p>
+                <div style={{ display: "flex", flexDirection: "row", gap: "10px", border: "1px solid gray", }} >
+                  <div>
+                    <input type="text" onInput={e=>setNewPeer((e.target as HTMLInputElement).value)} value={newPeer} />
+                    <button onClick={e=>addPeer(safe.address, newPeer )}>Add Peer</button>
+                  </div>
+                </div>
                 <div>
                   <button onClick={buildTxModal}> Build Tx </button>
                   <Modal style={txBuilderStyles} isOpen={buildingTx} onRequestClose={doneTxModal}>
                     <TxBuilder safe={safe} />
                   </Modal>
                 </div>
-                <div style={{ display: "flex", flexDirection: "row", gap: "10px", border: "1px solid gray", }} >
-                  <div>
-                    <input type="text" onInput={e=>setNewPeer((e.target as HTMLInputElement).value)} value={newPeer} />
-                    <button onClick={e=>addPeer(safe.address, newPeer )}>Add Peer</button>
-                  </div>
-                  <div>
-                    <button onClick={e=>sendDev(safe.address, "0xB7b54cd129e6D8B24e6AE652a473449B273eE3E4")}>Send to dev</button>
-                  </div>
-                </div>
-                <div> { safe.peers || null } </div>
-                <div> txs: 
-                  { safe.txs ? Object.keys(safe.txs).map(nonce => <TxComponent key={nonce} safe={safe.address} txs={safe.txs[nonce]}/>) : null }
-                </div>
               </div>
-            ) 
-          } 
-        </div>
-
+              <div style={{width: "50%"}}> 
+                txs: 
+                { safe.txs ? Object.keys(safe.txs).map(nonce => <TxComponent key={nonce} safe={safe.address} txs={safe.txs[nonce]}/>) : null }
+              </div>
+            </div>
+          </div> : null 
+        }
+        
 
       </div>
     </div>

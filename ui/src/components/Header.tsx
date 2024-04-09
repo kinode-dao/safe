@@ -87,14 +87,12 @@ function Header ({msg, openConnect, closeConnect, hideConnect = false}: HeaderPr
                         ) : (
                             <div className="col">
                                 <div style={{ textAlign: 'center', lineHeight: '1.5em' }}>You must connect to a browser wallet to continue</div>
-                                {/* <div style={{ textAlign: 'center', lineHeight: '1.5em' }}>We recommend <a href="https://metamask.io/download.html" target="_blank" rel="noreferrer">MetaMask</a></div> */}
-                                {isActivating ? (
-                                    <Loader msg="Approve connection in your wallet" />
-                                ) : (
-                                    <button onClick={connectWallet}> Connect Wallet </button>
-                                )}
+                                { isActivating 
+                                    ?  <Loader msg="Approve connection in your wallet" />
+                                    :  <button onClick={connectWallet}> Connect Wallet </button>
+                                }
                                 <div style={{ textAlign: 'center', lineHeight: '1.5em', fontSize: '0.8em', marginTop: '2em' }}>
-                                    Uqbar is currently on the Sepolia Testnet, if you need testnet ETH, you can get some from the <a href="https://sepoliafaucet.com/" target="_blank" rel="noreferrer">Sepolia Faucet</a>
+                                    <a href="https://sepoliafaucet.com/" target="_blank" rel="noreferrer">Sepolia Faucet</a>
                                 </div>
                             </div>
                         )
